@@ -1,0 +1,6 @@
+logs/
+last_response.json
+captcha_param.txt
+__pycache__/
+*.pyc
+accounts.json.bak
