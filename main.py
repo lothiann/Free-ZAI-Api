@@ -586,9 +586,18 @@ class ZaiSession:
         return self.accounts[self.account_idx]
 
     async def switch_account(self, idx):
-        """Swap token cookie and restart the page session."""
+        """Swap token cookie, wipe cached auth state and restart the page."""
         acc = self.accounts[idx]
         log(f"[rotate] -> account #{idx} ({acc.get('name') or acc.get('email') or 'unnamed'})")
+
+        # wipe localStorage/sessionStorage of the OLD origin first:
+        # z.ai caches the user there and restores the previous session on load,
+        # which overwrites our freshly-set cookie back to the old account
+        try:
+            await self.page.evaluate("try{localStorage.clear();sessionStorage.clear();}catch(e){}")
+        except Exception:
+            pass
+
         await self.context.clear_cookies()
         await self.context.add_cookies([
             {'name': 'token', 'value': acc["token"], 'domain': '.z.ai', 'path': '/'},
