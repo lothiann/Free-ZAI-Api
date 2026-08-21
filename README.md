@@ -28,6 +28,8 @@ client (opencode)                proxy (main.py)                  chat.z.ai
 ## Install
 
 ```bash
+git clone https://github.com/lothiann/Free-ZAI-Api.git
+cd Free-ZAI-Api
 pip install -r requirements.txt
 playwright install chromium
 ```
