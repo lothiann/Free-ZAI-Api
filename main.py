@@ -213,8 +213,15 @@ CRITICAL: the <tc> opening tag and </tc> closing tag are MANDATORY parts of EVER
 Rules:
 - "name" MUST be an exact tool name from the list above.
 - "arguments" MUST be a JSON object matching that tool's Parameters JSON schema exactly. Use {} if the tool takes no arguments.
-- The content between <tc> and </tc> must be ONE valid JSON object and nothing else: no comments, no trailing commas, no markdown fences.
-- Multiple tool calls = multiple consecutive <tc>...</tc> blocks, each fully wrapped in its own tags.
+- The content between <tc> and </tc> must be valid JSON and nothing else: no comments, no trailing commas, no markdown fences.
+- Multiple tool calls = ONE <tc> block containing SEVERAL JSON objects back-to-back:
+
+<tc>
+{"name": "tool1", "arguments": {"param_name": "value"}}
+{"name": "tool2", "arguments": {}}
+</tc>
+
+Never split parallel calls into separate <tc> blocks.
 - Never use other formats: no bare JSON without tags, no {"tool_calls":[...]}, no [function_calls], no native XML tags like <bash>, <read>, <write>, <glob>.
 - If a call is not needed, answer normally without mentioning tools or this format.
 - Do not output anything after the closing </tc>. Stop immediately and wait for results.
@@ -225,7 +232,8 @@ Correct example (calling a hypothetical "bash" tool):
 
 Incorrect examples — these are NOT valid tool calls and will be IGNORED:
 {"name": "TOOL_NAME_HERE", "arguments": {"param_name": "value"}}     <- BAD: bare JSON without <tc></tc> wrapper
-{"name": "bash", "arguments": {"command": "dir"}}                    <- BAD: bare JSON without tags
+<tc>{"name": "a", "arguments": {}}</tc>
+<tc>{"name": "b", "arguments": {}}</tc>                              <- BAD: parallel calls split into separate <tc> blocks; use ONE block with several JSON objects
 <tc>{"name": "bash", "arguments": {"command": "dir"}}                <- BAD: missing closing </tc>
 {"name": "bash", "arguments": {"command": "dir"}}</tc>               <- BAD: missing opening <tc>
 Never output a bare JSON object alone. ALWAYS wrap it: <tc>JSON</tc>"""
@@ -309,18 +317,60 @@ def tool_result_to_text(call_id, name, content):
     return f"<tc_result>\n{payload}\n</tc_result>"
 
 
-def parse_tool_call_blocks(text):
-    """Parse all <tc>{json}</tc> blocks. Tolerates markdown fences."""
-    calls = []
-    for m in re.finditer(r"<tc>\s*([\s\S]*?)\s*</tc>", text):
-        inner = m.group(1).strip()
-        inner = re.sub(r"^```(?:json)?\s*", "", inner)
-        inner = re.sub(r"\s*```$", "", inner).strip()
-        try:
-            obj = json.loads(inner)
-        except json.JSONDecodeError:
-            log(f"[tools] invalid JSON in tool_call block: {inner[:200]}", level="WARN")
+def _extract_json_objects(s):
+    """Extract top-level balanced {...} objects from a string."""
+    objs, depth, start = [], 0, None
+    in_str = esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
             continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objs.append(s[start:i + 1])
+                    start = None
+    return objs
+
+
+def parse_tool_call_blocks(text):
+    """Parse tool calls from the FIRST <tc>...</tc> block only.
+    The protocol: ONE block containing ONE or SEVERAL consecutive JSON objects
+    (parallel calls). Extra blocks are ignored with a warning."""
+    calls = []
+    blocks = list(re.finditer(r"<tc>\s*([\s\S]*?)\s*</tc>", text))
+    if not blocks:
+        return calls
+    if len(blocks) > 1:
+        log(f"[tools] {len(blocks)} separate <tc> blocks found, using only the first "
+            f"(protocol = one block with several JSON objects)", level="WARN")
+    inner = blocks[0].group(1).strip()
+    inner = re.sub(r"^```(?:json)?\s*", "", inner)
+    inner = re.sub(r"\s*```$", "", inner).strip()
+    candidates = []
+    try:
+        obj = json.loads(inner)
+        candidates = [obj]
+    except json.JSONDecodeError:
+        # several JSON objects inside one block -> split by brace balance
+        for raw in _extract_json_objects(inner):
+            try:
+                candidates.append(json.loads(raw))
+            except json.JSONDecodeError:
+                log(f"[tools] invalid JSON fragment skipped: {raw[:120]}", level="WARN")
+    for obj in candidates:
         if isinstance(obj, dict) and obj.get("name"):
             calls.append({
                 "name": str(obj["name"]),
@@ -964,6 +1014,7 @@ async def chat_completions(request: Request):
             full_answer = []
             tool_buf = ToolStreamBuffer() if has_tools else None
             finish_reason = "stop"
+            tool_call_index = 0
             try:
                 async for phase, delta in session.stream_tokens():
                     if phase == "error":
@@ -991,12 +1042,13 @@ async def chat_completions(request: Request):
                         for tc in calls_batch:
                             yield sse(make_chunk(chunk_id, created, req_model, {
                                 "tool_calls": [{
-                                    "index": 0,
+                                    "index": tool_call_index,
                                     "id": "call_" + secrets.token_hex(8),
                                     "type": "function",
                                     "function": {"name": tc["name"], "arguments": tc["arguments"]},
                                 }]
                             }))
+                            tool_call_index += 1
 
                 if tool_buf is not None:
                     leftover = tool_buf.flush()
