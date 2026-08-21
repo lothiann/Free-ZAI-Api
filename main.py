@@ -335,13 +335,14 @@ parse_ml_tool_calls = parse_tool_call_blocks
 
 class ToolStreamBuffer:
     """Streams visible text, captures <tc>{json}</tc> blocks
-    and converts them to OpenAI tool_calls."""
+    and converts them to OpenAI tool_calls.
+    If a captured block turns out not to be a valid tool call
+    (e.g. '<tc>' mentioned in prose/code), its text is released back
+    to the output so nothing is lost."""
 
     def __init__(self):
         self.buf = ""
         self.capturing = False
-        self.pending_calls = []
-        self.had_calls = False
 
     def feed(self, delta):
         """Returns (visible_text, newly_completed_calls_or_None)."""
@@ -368,7 +369,7 @@ class ToolStreamBuffer:
 
             end = self.buf.find("</tc>")
             if end == -1:
-                break  # wait for more data
+                break  # wait for more data inside the block
             block_end = end + len("</tc>")
             block = self.buf[:block_end]
             self.buf = self.buf[block_end:]
@@ -376,10 +377,9 @@ class ToolStreamBuffer:
 
             calls = parse_tool_call_blocks(block)
             if calls:
-                self.pending_calls.extend(calls)
-                self.had_calls = True
-                completed = calls  # last parsed batch; generator emits each batch
-            # if parse failed -> block silently dropped (logged inside)
+                completed = calls  # real tool call -> consumed, not visible
+            else:
+                visible_out += block  # false positive -> release as plain text
 
         return visible_out, completed
 
@@ -393,13 +393,10 @@ class ToolStreamBuffer:
         return 0
 
     def flush(self):
-        """Final drain at stream end: release leftover as visible."""
-        leftover = ""
-        if self.buf and not self.capturing:
-            leftover = self.buf
-        elif self.capturing and self.buf:
-            log(f"[tools] discarding unterminated tool_call block ({len(self.buf)} chars)", level="WARN")
+        """Final drain at stream end: release everything still buffered."""
+        leftover = self.buf
         self.buf = ""
+        self.capturing = False
         return leftover
 
 THINKING_TRIGGER_JS = """
