@@ -1049,6 +1049,22 @@ class ZaiSession:
             }
         """)
 
+    async def stop_generation(self):
+        """Click the site's Stop button (aria-label='Stop') once."""
+        js = """
+            () => {
+                const wrap = document.querySelector('div[aria-label="Stop"]');
+                const b = wrap && wrap.querySelector('button');
+                if (!b) return false;
+                b.click();
+                return true;
+            }
+        """
+        try:
+            return bool(await self.page.evaluate(js))
+        except Exception:
+            return False
+
     async def stream_tokens(self, timeout_s=300):
         """Yield (phase, delta) tuples until done."""
         while True:
@@ -1264,6 +1280,17 @@ async def chat_completions(request: Request):
                     "usage": usage_out,
                 })
                 yield "data: [DONE]\n\n"
+            except (asyncio.CancelledError, GeneratorExit):
+                # Client went away mid-stream -> stop generation on the site.
+                # NOTE: awaiting anything here is pointless - the generator is
+                # being finalized and won't resume. So the click AND its log
+                # live in an independent task that survives the teardown.
+                async def _stop_and_log():
+                    stopped = await session.stop_generation()
+                    log(f"[stream] client disconnected -> stop button "
+                        f"{'clicked' if stopped else 'NOT found'}")
+                asyncio.create_task(_stop_and_log())
+                raise
             finally:
                 log(f"<-- done: reasoning={sum(len(x) for x in full_reasoning)}ch answer={sum(len(x) for x in full_answer)}ch")
                 with open("last_response.json", "w", encoding="utf-8") as f:
