@@ -6,6 +6,7 @@ import time
 import uuid
 import sys
 import os
+import tempfile
 from datetime import datetime
 
 from playwright.async_api import async_playwright
@@ -660,6 +661,7 @@ class ZaiSession:
         self._models_cache = None
         self._models_cache_ts = 0
         self.last_activity = 0.0
+        self.last_usage = None
         # account rotation
         self.accounts, self.rotate_every = load_accounts()
         self.account_idx = 0
@@ -818,6 +820,17 @@ class ZaiSession:
                 return c
             return json.dumps(c, ensure_ascii=False)
 
+        def _reasoning_str(m):
+            """opencode sends assistant reasoning back as content parts
+            {"type": "reasoning", "text": ...} (or a reasoning_content field)."""
+            c = m.get("content")
+            if isinstance(c, list):
+                parts = [x.get("text", "") for x in c
+                         if isinstance(x, dict) and x.get("type") == "reasoning"]
+                return "\n".join(p for p in parts if p)
+            rc = m.get("reasoning_content") or m.get("reasoning")
+            return str(rc) if rc else ""
+
         hist_lines = []
         for m in messages:
             role = m.get("role")
@@ -829,6 +842,9 @@ class ZaiSession:
                 hist_lines.append({"role": "user", "content": content})
             elif role == "assistant":
                 line = {"role": "assistant", "content": content or ""}
+                reasoning = _reasoning_str(m)
+                if reasoning:
+                    line["thinking"] = reasoning
                 calls = []
                 for tc in m.get("tool_calls") or []:
                     fn = tc.get("function") or {}
@@ -959,15 +975,61 @@ class ZaiSession:
 
     async def send_message(self, prompt):
         # drain stale tokens
+        self.last_usage = None
         while not self.token_queue.empty():
             self.token_queue.get_nowait()
 
+        sent_as_file = await self._send_prompt_file(prompt)
+        if not sent_as_file:
+            await self._fill_and_send(prompt)
+
+    async def _send_prompt_file(self, prompt):
+        """Write the prompt to a temp .md and attach it via the site's
+        upload button (#upload-file-button -> native file chooser).
+        Message text is just '.'. Falls back to False if the flow fails."""
+        tmp_path = None
+        try:
+            has_btn = await self.page.evaluate(
+                "() => !!document.querySelector('#upload-file-button')")
+            if not has_btn:
+                return False
+
+            fname = f"prompt_{secrets.token_hex(4)}.md"
+            tmp_path = os.path.join(tempfile.gettempdir(), fname)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(prompt)
+
+            async with self.page.expect_file_chooser(timeout=8000) as fc_info:
+                await self.page.click("#upload-file-button")
+            chooser = await fc_info.value
+            await chooser.set_files(tmp_path)
+
+            # wait until the file shows up as attached (chip / preview)
+            attached = await poll_js(self.page,
+                                     f"() => document.body.innerText.includes('{fname}')",
+                                     timeout_s=20, poll_ms=200)
+            if not attached:
+                return False
+            await asyncio.sleep(1.0)  # let any client-side parsing settle
+
+            await self._fill_and_send(".")
+            return True
+        except Exception:
+            return False
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    async def _fill_and_send(self, text):
         textarea = await self.page.wait_for_selector('textarea', timeout=10000)
         try:
             await textarea.click(timeout=3000)
         except Exception:
             await self.page.evaluate("() => document.querySelector('textarea').click()")
-        await textarea.fill(prompt)
+        await textarea.fill(text)
 
         send_ready = await poll_js(self.page, """
             () => {
@@ -1004,6 +1066,7 @@ class ZaiSession:
                 yield ("error", json.dumps(item["error"]))
                 return
             if "usage" in item:
+                self.last_usage = item.get("usage")
                 continue
             delta = item.get("delta") or ""
             if delta:
@@ -1065,6 +1128,27 @@ def make_chunk(chunk_id, created, model, delta, finish_reason=None):
         "created": created,
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+def build_usage(session, full_reasoning, full_answer):
+    """Real usage from the z.ai stream when available; rough char/4
+    estimates otherwise. reasoning_tokens is always an estimate."""
+    u = getattr(session, "last_usage", None) or {}
+    pt = u.get("prompt_tokens") or 0
+    ct = u.get("completion_tokens") or 0
+    tt = u.get("total_tokens") or (pt + ct)
+    if not (pt or ct or tt):
+        prompt_len = getattr(session, "last_prompt_chars", 0)
+        answer_len = sum(len(x) for x in full_answer)
+        pt, ct, tt = prompt_len // 4, answer_len // 4, (prompt_len + answer_len) // 4
+    reasoning_est = sum(len(x) for x in full_reasoning) // 4
+    details = {"reasoning_tokens": reasoning_est} if reasoning_est else {}
+    return {
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "total_tokens": tt,
+        "completion_tokens_details": details,
     }
 
 
@@ -1170,6 +1254,15 @@ async def chat_completions(request: Request):
                         yield sse(make_chunk(chunk_id, created, req_model, {"content": leftover}))
 
                 yield sse(make_chunk(chunk_id, created, req_model, {}, finish_reason=finish_reason))
+                usage_out = build_usage(session, full_reasoning, full_answer)
+                yield sse({
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req_model,
+                    "choices": [],
+                    "usage": usage_out,
+                })
                 yield "data: [DONE]\n\n"
             finally:
                 log(f"<-- done: reasoning={sum(len(x) for x in full_reasoning)}ch answer={sum(len(x) for x in full_answer)}ch")
@@ -1235,7 +1328,7 @@ async def chat_completions(request: Request):
             "message": message,
             "finish_reason": finish,
         }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": build_usage(session, reasoning_parts, answer_parts),
     }
 
 
