@@ -6,7 +6,6 @@ import time
 import uuid
 import sys
 import os
-import tempfile
 from datetime import datetime
 
 from playwright.async_api import async_playwright
@@ -979,49 +978,7 @@ class ZaiSession:
         while not self.token_queue.empty():
             self.token_queue.get_nowait()
 
-        sent_as_file = await self._send_prompt_file(prompt)
-        if not sent_as_file:
-            await self._fill_and_send(prompt)
-
-    async def _send_prompt_file(self, prompt):
-        """Write the prompt to a temp .md and attach it via the site's
-        upload button (#upload-file-button -> native file chooser).
-        Message text is just '.'. Falls back to False if the flow fails."""
-        tmp_path = None
-        try:
-            has_btn = await self.page.evaluate(
-                "() => !!document.querySelector('#upload-file-button')")
-            if not has_btn:
-                return False
-
-            fname = f"prompt_{secrets.token_hex(4)}.md"
-            tmp_path = os.path.join(tempfile.gettempdir(), fname)
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(prompt)
-
-            async with self.page.expect_file_chooser(timeout=8000) as fc_info:
-                await self.page.click("#upload-file-button")
-            chooser = await fc_info.value
-            await chooser.set_files(tmp_path)
-
-            # wait until the file shows up as attached (chip / preview)
-            attached = await poll_js(self.page,
-                                     f"() => document.body.innerText.includes('{fname}')",
-                                     timeout_s=20, poll_ms=200)
-            if not attached:
-                return False
-            await asyncio.sleep(1.0)  # let any client-side parsing settle
-
-            await self._fill_and_send(".")
-            return True
-        except Exception:
-            return False
-        finally:
-            if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+        await self._fill_and_send(prompt)
 
     async def _fill_and_send(self, text):
         textarea = await self.page.wait_for_selector('textarea', timeout=10000)
