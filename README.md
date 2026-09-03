@@ -1,5 +1,8 @@
 # Free-ZAI-Api
 
+![Preview in terminal](image.png)
+
+
 Self-hosted OpenAI-compatible API proxy for [chat.z.ai](https://chat.z.ai) (GLM-5.3 / GLM-5.2 / etc).
 Runs a real browser session via **Playwright**, so the site sees a genuine Chrome fingerprint — the invisible Aliyun captcha passes automatically, no third-party captcha services needed.
 
