@@ -2,10 +2,12 @@ import asyncio
 import json
 import re
 import secrets
+import subprocess
 import time
 import uuid
 import sys
 import os
+import webbrowser
 from datetime import datetime
 
 from playwright.async_api import async_playwright
@@ -18,6 +20,11 @@ TOKEN = ""
 HOST = "127.0.0.1"
 PORT = 8492
 FALLBACK_MODEL = "glm-5.2"
+
+# ===== STARTUP MENU STATE (toggled from the console before launch) =====
+CAPTCHA_BYPASS = True    # [2] reload same account & retry when Aliyun captcha appears
+ACCOUNT_ROTATE = True    # [3] rotate between accounts after rotate_every requests
+HEADLESS = False         # [6] run the Playwright browser in headless mode
 REQUEST_COOLDOWN = 5.0  # seconds between requests, avoids captcha on rapid fire
 ACCOUNTS_FILE = "accounts.json"
 
@@ -678,8 +685,6 @@ class ZaiSession:
         account_idx or requests_on_account, so it never counts as a rotation.
         """
         acc = self.accounts[self.account_idx]
-        log(f"[captcha-reload] wiping state, staying on account #{self.account_idx} "
-            f"'{acc.get('name') or acc.get('email') or 'unnamed'}'")
         try:
             await self.page.evaluate("try{localStorage.clear();sessionStorage.clear();}catch(e){}")
         except Exception:
@@ -693,8 +698,7 @@ class ZaiSession:
         # and miss the storage wipe, so the captcha survives).
         try:
             await self.page.reload(wait_until='domcontentloaded', timeout=60000)
-        except Exception as e:
-            log(f"[captcha-reload] page.reload failed ({e}); falling back to goto", level="WARN")
+        except Exception:
             await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
         # double-check we are actually on the chat origin
         if self.page.url and "chat.z.ai" not in self.page.url:
@@ -709,6 +713,8 @@ class ZaiSession:
         'done' sentinel so stream_tokens() wakes up instead of blocking forever
         (the server cuts the stream when the captcha pops up)."""
         try:
+            if not CAPTCHA_BYPASS:
+                return False
             while not stop_event.is_set():
                 if await self.is_captcha():
                     captcha_event.set()
@@ -728,7 +734,7 @@ class ZaiSession:
 
     async def before_request(self):
         """Called inside lock: rotate if needed. Returns current account."""
-        if self.requests_on_account >= self.rotate_every:
+        if ACCOUNT_ROTATE and self.requests_on_account >= self.rotate_every:
             next_idx = (self.account_idx + 1) % len(self.accounts)
             if len(self.accounts) > 1:
                 await self.switch_account(next_idx)
@@ -748,7 +754,7 @@ class ZaiSession:
     async def start(self):
         p = await async_playwright().start()
         self.browser = await p.chromium.launch(
-            headless=False,
+            headless=HEADLESS,
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
         )
         self.context = await self.browser.new_context(
@@ -1221,9 +1227,7 @@ async def chat_completions(request: Request):
                 # counting a rotation. A retry is only done when the captcha
                 # appears BEFORE any thinking/answer output was delivered to the
                 # client (otherwise a silent retry would duplicate sent tokens).
-                attempts = 0
                 while True:
-                    attempts += 1
                     # state is per-attempt (reset on every retry)
                     full_reasoning = []
                     full_answer = []
@@ -1246,9 +1250,8 @@ async def chat_completions(request: Request):
                             or "not found in dropdown" in msg
                             or "enabled" in msg
                         )
-                        if transient and attempts < 3:
-                            log(f"[captcha] Aliyun captcha/transient detected -> retry "
-                                f"(attempt {attempts})", level="WARN")
+                        if transient and CAPTCHA_BYPASS:
+                            log("[captcha] Aliyun captcha detected during prepare -> retry", level="WARN")
                             await session.reload_current()
                             continue
                         yield sse({"error": {"message": str(e), "type": "proxy_error"}})
@@ -1315,15 +1318,9 @@ async def chat_completions(request: Request):
                         return
 
                     if captcha_abort:
-                        if attempts < 3:
-                            log(f"[captcha] Aliyun captcha detected during stream -> retry "
-                                f"(attempt {attempts})", level="WARN")
-                            await session.reload_current()
-                            continue
-                        yield sse({"error": {"message": "Aliyun captcha persisted after retries",
-                                             "type": "proxy_error"}})
-                        yield "data: [DONE]\n\n"
-                        return
+                        log("[captcha] Aliyun captcha detected during stream -> retry", level="WARN")
+                        await session.reload_current()
+                        continue
 
                     # no captcha, no stream error -> clean completion
                     break
@@ -1372,9 +1369,7 @@ async def chat_completions(request: Request):
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     # non-streaming: accumulate
-    attempts = 0
     while True:
-        attempts += 1
         reasoning_parts, answer_parts = [], []
         raw_answer = ""
         tool_buf = ToolStreamBuffer() if has_tools else None
@@ -1432,12 +1427,9 @@ async def chat_completions(request: Request):
                                 status_code=502)
         if not captcha_abort:
             break
-        if attempts < 3:
-            log(f"[captcha] Aliyun captcha detected -> retry (attempt {attempts})", level="WARN")
-            await session.reload_current()
-            continue
-        return JSONResponse({"error": {"message": "Aliyun captcha persisted after retries",
-                                       "type": "proxy_error"}}, status_code=502)
+        log("[captcha] Aliyun captcha detected -> retry", level="WARN")
+        await session.reload_current()
+        continue
 
     content = "".join(answer_parts)
     message = {"role": "assistant", "content": content,
@@ -1468,11 +1460,206 @@ async def chat_completions(request: Request):
 
 
 async def main():
+    await run_menu()
     await session.start()
     log(f"Starting OpenAI-compatible server on http://{HOST}:{PORT}/v1")
     config = uvicorn.Config(app, host=HOST, port=PORT, log_level="warning")
     server = uvicorn.Server(config)
     await server.serve()
+
+
+# ===== STARTUP MENU =====
+
+LOGO = r"""███████╗██████╗ ███████╗███████╗   ███████╗ █████╗ ██╗       █████╗ ██████╗ ██╗
+██╔════╝██╔══██╗██╔════╝██╔════╝   ╚══███╔╝██╔══██╗██║      ██╔══██╗██╔══██╗██║
+█████╗  ██████╔╝█████╗  █████╗█████╗ ███╔╝ ███████║██║█████╗███████║██████╔╝██║
+██╔══╝  ██╔══██╗██╔══╝  ██╔══╝╚════╝███╔╝  ██╔══██║██║╚════╝██╔══██║██╔═══╝ ██║
+██║     ██║  ██║███████╗███████╗   ███████╗██║  ██║██║      ██║  ██║██║     ██║
+╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝   ╚══════╝╚═╝  ╚═╝╚═╝      ╚═╝  ╚═╝╚═╝     ╚═╝"""
+
+
+RESET = "\x1b[0m"
+
+
+def _enable_ansi():
+    """Enable ANSI color codes on Windows console (no-op elsewhere)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_uint32()
+            kernel32.GetConsoleMode(h, ctypes.byref(mode))
+            kernel32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            pass
+
+
+def _clear():
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def _tick(on):
+    if on:
+        return "\x1b[32mON\x1b[0m"   # green
+    return "\x1b[31mOFF\x1b[0m"      # red
+
+
+def _visible_len(s):
+    """Length of a string ignoring ANSI escape codes (for alignment)."""
+    return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
+
+
+def _term_width():
+    try:
+        return os.get_terminal_size().columns
+    except Exception:
+        return 80
+
+
+def _center(s, width=None):
+    """Center a plain (non-ANSI) string on a terminal line."""
+    if width is None:
+        width = _term_width()
+    left = max(0, (width - len(s)) // 2)
+    return " " * left + s
+
+
+def _ansi_color(t):
+    """45° gradient: purple (top-left) -> cyan (bottom-right) via linear lerp."""
+    r1, g1, b1 = 147, 112, 219  # purple
+    r2, g2, b2 = 0, 200, 255     # cyan
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+
+def _gradient_lines(lines, width):
+    h = len(lines)
+    pad_w = max(len(l) for l in lines)
+    left = max(0, (width - pad_w) // 2)
+    out = []
+    for y, line in enumerate(lines):
+        painted = " " * left
+        for x, ch in enumerate(line):
+            t = (x + y) / max(1, (pad_w - 1) + (h - 1))
+            painted += _ansi_color(t) + ch
+        out.append(painted + RESET)
+    return out
+
+
+def _render_menu():
+    _enable_ansi()
+    _clear()
+    w = _term_width()
+    for line in _gradient_lines(LOGO.splitlines(), w):
+        print(line)
+    print()
+    table = [
+        ["[1] Start", f"[4] API Port: {PORT}", "[7] GitHub"],
+        [f"[2] {_tick(CAPTCHA_BYPASS)} Captcha Bypass", "[5] Open accounts.json", "[8] Exit"],
+        [f"[3] {_tick(ACCOUNT_ROTATE)} Account Rotate", f"[6] {_tick(HEADLESS)} Headless Browser", ""],
+    ]
+    # One fixed width per column = the widest cell in that column; each column
+    # is then separated by exactly COL_GAP spaces, so all rows align perfectly.
+    COL_GAP = 3
+    ncols = max(len(r) for r in table)
+    col_w = [max(_visible_len(r[i]) if i < len(r) else 0 for r in table) for i in range(ncols)]
+    rows = []
+    for r in table:
+        line = ""
+        for i in range(ncols):
+            cell = r[i] if i < len(r) else ""
+            line += cell + " " * (col_w[i] - _visible_len(cell))
+            if i < ncols - 1:
+                line += " " * COL_GAP
+        rows.append(line)
+    # Center the whole block as one unit so EVERY row shares the SAME left
+    # offset (otherwise each row centers itself and the columns drift apart).
+    block_w = max(_visible_len(r) for r in rows)
+    left = max(0, (w - block_w) // 2)
+    for r in rows:
+        print(" " * left + r)
+    print()
+
+
+def open_accounts_file():
+    """Open accounts.json in the default editor/app (works on win/mac/linux)."""
+    path = os.path.abspath(ACCOUNTS_FILE)
+    try:
+        if os.name == "nt":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        log(f"[menu] opened {path}")
+    except Exception as e:
+        log(f"[menu] could not open accounts.json: {e}", level="ERROR")
+
+
+GITHUB_URL = "https://github.com/lothiann/Free-ZAI-Api"
+
+
+def open_github():
+    """Open the GitHub repo in the default browser (works on win/mac/linux)."""
+    try:
+        webbrowser.open(GITHUB_URL)
+        log(f"[menu] opened {GITHUB_URL}")
+    except Exception as e:
+        log(f"[menu] could not open GitHub: {e}", level="ERROR")
+
+
+async def run_menu():
+    """Interactive startup menu. Returns when the user picks [1] Start."""
+    global PORT, HEADLESS, CAPTCHA_BYPASS, ACCOUNT_ROTATE
+    while True:
+        _render_menu()
+        try:
+            choice = input(" Choice: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            # Ctrl+C at the main prompt exits the program
+            _clear()
+            log("[menu] exited (Ctrl+C)")
+            raise SystemExit(0)
+        if choice == "1":
+            _clear()
+            return
+        elif choice == "2":
+            CAPTCHA_BYPASS = not CAPTCHA_BYPASS
+        elif choice == "3":
+            ACCOUNT_ROTATE = not ACCOUNT_ROTATE
+        elif choice == "4":
+            try:
+                new_port = input("\n API Port (ESC to cancel): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                new_port = ""
+            # ESC (\x1b) or 'esc' or empty cancels back to the menu
+            if new_port in ("", "esc", "\x1b") or "\x1b" in new_port:
+                continue
+            try:
+                PORT = int(new_port)
+            except ValueError:
+                log(f"[menu] invalid port: {new_port!r}", level="ERROR")
+        elif choice == "5":
+            open_accounts_file()
+            try:
+                input("\n Press Enter to continue...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+        elif choice == "6":
+            HEADLESS = not HEADLESS
+        elif choice == "7":
+            open_github()
+            try:
+                input("\n Press Enter to continue...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+        elif choice == "8":
+            _clear()
+            log("[menu] exited")
+            raise SystemExit(0)
 
 
 if __name__ == "__main__":
