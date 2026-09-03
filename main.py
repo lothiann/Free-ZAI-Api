@@ -758,7 +758,7 @@ class ZaiSession:
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
         )
         self.context = await self.browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
             viewport={'width': 1536, 'height': 735},
             screen={'width': 1680, 'height': 1050},
             device_scale_factor=1.25,
