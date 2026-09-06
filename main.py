@@ -241,42 +241,52 @@ JSON WHITELIST - the ONLY JSON you may EVER write in your reply is exactly {"nam
 - Do not output anything after </tc>. Stop immediately and wait for results.
 - If no suitable tool exists, pick an alternative from the EXISTING list; do not even mention other tools.
 - Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\\\) - single raw backslashes are invalid JSON escapes.
+- It is recommended to use a colon to indicate that you are calling the tool:
+
+Now I will read:
+<tc> ... </tc>
 </RULES>
 
 Incorrect:
-!{{BAD}}!: {"name": "bash", "arguments": {"command": "..."}}                                   <- bare JSON without <tc></tc> wrapper
-!{{BAD}}!: <tc>{"name": "bash", "arguments": {"command": "..."}}                               <- missing closing </tc>
-!{{BAD}}!: {"name": "bash", "arguments": {"command": "dir"}}</tc>                              <- missing opening <tc>
-!{{BAD}}!: <tc>{"name": "bash", "arguments": {"command": "..."}</tc>                           <- missing closing }
-!{{BAD}}!: I'll read it now... (nothing)                                                       <- narrated instead of calling
-!{{BAD}}!: I'll read it now... <tc>{"name": "read", "arguments": {"filePath": "/f"}}</tc>        <- call not moved to its own line
-!{{BAD}}!: Let me search for that. {"name": "grep", "arguments": {"pattern": "x"}}              <- bare JSON next to text is NOT a call
-!{{BAD}}!: <tc>{"name": "a", "arguments": {}}</tc> <tc>{"name": "b", "arguments": {}}</tc>     <- parallel calls split; use ONE block with several objects
-!{{BAD}}!: <tool_call>...</tool_call>, <arg_value>...</arg_value>, search.todowrite, readfilePath   <- non-existent blocks/tools
-!{{BAD}}!: <tc>{"name": "bash", "arguments": {"command": "rg -n "p" src/"}}</tc>                <- raw inner quotes break JSON; escape them as \\"
-!{{BAD}}!: <tc>{"name": "...", 'arguments': {"..."}}</tc>                                      <- single quotes are invalid JSON
-!{{BAD}}!: <tc>{"name": "...", "arguments": {"filePath": "\\Project\\file.h"}}</tc>            <- raw backslashes are invalid JSON escapes
-!{{BAD}}!: <tc>{"name": "...", "arguments": {}} // fetch it</tc>                               <- no comments inside the block
-!{{BAD}}!: <tc>{"name": "...", "arguments": {},}</tc>                                          <- no trailing comma
-!{{BAD}}!: <tc>{"name": "TOOL_NAME_HERE", "arguments": {"param_name": "value"}}</tc>           <- replace placeholders with real values
-!{{BAD}}!: {"tool_calls": [{"name": "a"}, {"name": "b"}]}                                      <- array-wrapper format does not exist here
+<BAD_EXAMPLES>
+{"name": "bash", "arguments": {"command": "..."}}                                      <- bare JSON without <tc></tc> wrapper
+<tc>{"name": "bash", "arguments": {"command": "..."}}                                  <- missing closing </tc>
+{"name": "bash", "arguments": {"command": "dir"}}</tc>                                 <- missing opening <tc>
+<tc>{"name": "bash", "arguments": {"command": "..."}</tc>                              <- missing closing }
+<tc>{"name": "bash", "arguments": {"command": "..."}}]</tc>                            <- an unnecessary square bracket
+<tc>{"name": "...", "arguments": {"...": 123"}}</tc>                                   <- unnecessary quotation mark
+I'll read it now... (nothing)                                                          <- narrated instead of calling
+I'll read it now... <tc>{"name": "read", "arguments": {"filePath": "/f"}}</tc>         <- call not moved to its own line
+Let me search for that. {"name": "grep", "arguments": {"pattern": "x"}}                <- bare JSON next to text is NOT a call
+<tc>{"name": "a", "arguments": {}}</tc> <tc>{"name": "b", "arguments": {}}</tc>        <- parallel calls split; use ONE block with several objects
+<tool_call>...</tool_call>; <arg_value>...</arg_value>; search.todowrite, readfilePath <- non-existent blocks/tools
+<tc>{"name": "bash", "arguments": {"command": "rg -n "p" src/"}}</tc>                  <- raw inner quotes break JSON; escape them as \\"
+<tc>{"name": "...", 'arguments': {"..."}}</tc>                                         <- single quotes are invalid JSON
+<tc>{"name": "...", "arguments": {"filePath": "\\Project\\file.h"}}</tc>               <- raw backslashes are invalid JSON escapes
+<tc>{"name": "...", "arguments": {}} // fetch it</tc>                                  <- no comments inside the block
+<tc>{"name": "...", "arguments": {},}</tc>                                             <- no trailing comma
+<tc>{"name": "TOOL_NAME_HERE", "arguments": {"param_name": "value"}}</tc>              <- replace placeholders with real values
+{"tool_calls": [{"name": "a"}, {"name": "b"}]}                                         <- array-wrapper format does not exist here
+</BAD_EXAMPLES>
 
 Correct:
-GOOD (single call) - brief prose if needed, then ONE block on its own line, then STOP completely:
+<GOOD_EXAMPLES>
+single call - brief prose if needed, then ONE block on its own line, then STOP completely:
 Let me read that file.
 <tc>{"name": "read", "arguments": {"filePath": "/project/file.txt"}}</tc>
 
-GOOD (parallel calls) - ONE block, SEVERAL JSON objects, stop right after:
+parallel calls - ONE block, SEVERAL JSON objects, stop right after:
 <tc>
 {"name": "glob", "arguments": {"pattern": "**/*.ts"}}
 {"name": "grep", "arguments": {"pattern": "TODO"}}
 </tc>
 
-GOOD (/ paths - recommended):
+/ paths - recommended:
 <tc>{"name": "read", "arguments": {"filePath": "/Project/file.h"}}</tc>
 
-GOOD (escaped quotes in arguments):
+escaped quotes in arguments:
 <tc>{"name": "bash", "arguments": {"command": "rg -n \\"pattern\\" src/"}}</tc>
+</GOOD_EXAMPLES>
 
 <EXAMPLES> Examples (*If you are running in the OpenCode CLI):
 
