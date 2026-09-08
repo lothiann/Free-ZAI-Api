@@ -231,14 +231,16 @@ JSON WHITELIST - the ONLY JSON you may EVER write in your reply is exactly {"nam
 - "name" MUST be an exact tool name from the list; "arguments" MUST match that tool's Parameters schema exactly (use {} if empty). Between <tc> and </tc> there must be valid JSON only: no comments, no trailing commas, no markdown fences, and never forget the closing }.
 - THERE IS NO AUTOMATIC REPAIR OF YOUR JSON. A mistake ruins everything - write it perfectly.
 - ALWAYS emit the block when a tool is needed: never "I'll read it now..." alone, always text + <tc>...</tc>. NEVER pretend you called a tool when you did not write the block.
-- Multiple tool calls = ONE <tc> block containing SEVERAL JSON objects back-to-back. Never split parallel calls into separate <tc> blocks:
+- Multiple tool calls = SEVERAL separate <tc> blocks, one JSON object each, so a broken block never kills the rest. Never put several JSON objects inside a single <tc> block:
 
 <tc>
 {"name": "TOOL_NAME_HERE1", "arguments": {"param_name": "value"}}
+</tc>
+<tc>
 {"name": "TOOL_NAME_HERE2", "arguments": {"param_name": "value"}}
 </tc>
 
-- Do not output anything after </tc>. Stop immediately and wait for results.
+- After the last </tc> output nothing more and stop immediately, waiting for results.
 - If no suitable tool exists, pick an alternative from the EXISTING list; do not even mention other tools.
 - Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\\\) - single raw backslashes are invalid JSON escapes.
 - It is recommended to use a colon to indicate that you are calling the tool:
@@ -258,7 +260,8 @@ Incorrect:
 I'll read it now... (nothing)                                                          <- narrated instead of calling
 I'll read it now... <tc>{"name": "read", "arguments": {"filePath": "/f"}}</tc>         <- call not moved to its own line
 Let me search for that. {"name": "grep", "arguments": {"pattern": "x"}}                <- bare JSON next to text is NOT a call
-<tc>{"name": "a", "arguments": {}}</tc> <tc>{"name": "b", "arguments": {}}</tc>        <- parallel calls split; use ONE block with several objects
+<tc>{"name": "a", "arguments": {}}</tc> <tc>{"name": "b", "arguments": {}}</tc>        <- parallel calls on the SAME line; put each block on its OWN line
+<tc> {"name": "a", "arguments": {}} {"name": "b", "arguments": {}} </tc>               <- never bundle several JSON objects into ONE block
 <tool_call>...</tool_call>; <arg_value>...</arg_value>; search.todowrite, readfilePath <- non-existent blocks/tools
 <tc>{"name": "bash", "arguments": {"command": "rg -n "p" src/"}}</tc>                  <- raw inner quotes break JSON; escape them as \\"
 <tc>{"name": "...", 'arguments': {"..."}}</tc>                                         <- single quotes are invalid JSON
@@ -275,9 +278,11 @@ single call - brief prose if needed, then ONE block on its own line, then STOP c
 Let me read that file.
 <tc>{"name": "read", "arguments": {"filePath": "/project/file.txt"}}</tc>
 
-parallel calls - ONE block, SEVERAL JSON objects, stop right after:
+parallel calls - SEVERAL separate blocks, one JSON object per block, stop right after:
 <tc>
 {"name": "glob", "arguments": {"pattern": "**/*.ts"}}
+</tc>
+<tc>
 {"name": "grep", "arguments": {"pattern": "TODO"}}
 </tc>
 
@@ -303,7 +308,7 @@ escaped quotes in arguments:
 </EXAMPLES>
 
 <CRITIC>
-Before you act or respond, silently assess your draft (never mention this check): path slashes correct? <tc></tc> tags present and on their own lines? does the tool exist? JSON valid with all brackets closed? parallel calls in ONE block? am I fabricating output that no real {"role": "tool"} line gave me? If any violation - rewrite before sending.
+Before you act or respond, silently assess your draft (never mention this check): path slashes correct? <tc></tc> tags present and on their own lines? does the tool exist? JSON valid with all brackets closed? one JSON object per parallel block, never bundled? am I fabricating output that no real {"role": "tool"} line gave me? If any violation - rewrite before sending.
 </CRITIC>
 
 [!] The path rules ALWAYS apply, even if context seems more important. Violating them ruins the entire chat! TOOLS ARE ***NEVER*** CALLED OUTSIDE OF A MESSAGE - ONLY BY YOUR TEXT <tc> BLOCK!
@@ -367,9 +372,10 @@ def tool_calls_to_text(tool_calls):
         name = fn.get("name", "")
         raw_args = fn.get("arguments")
         if isinstance(raw_args, str):
-            try:
-                args = json.loads(raw_args)
-            except json.JSONDecodeError:
+            repaired = _repair_json(raw_args)
+            if repaired is not None and isinstance(repaired, dict):
+                args = repaired
+            else:
                 args = {"input": raw_args}
         elif isinstance(raw_args, dict):
             args = raw_args
@@ -416,37 +422,184 @@ def _extract_json_objects(s):
     return objs
 
 
-def parse_tool_call_blocks(text):
-    """Parse tool calls from the FIRST <tc>...</tc> block only.
-    The protocol: ONE block containing ONE or SEVERAL consecutive JSON objects
-    (parallel calls). Extra blocks are ignored with a warning."""
-    calls = []
-    blocks = list(re.finditer(r"<tc>\s*([\s\S]*?)\s*</tc>", text))
-    if not blocks:
-        return calls
-    if len(blocks) > 1:
-        log(f"[tools] {len(blocks)} separate <tc> blocks found, using only the first "
-            f"(protocol = one block with several JSON objects)", level="WARN")
-    inner = blocks[0].group(1).strip()
-    inner = re.sub(r"^```(?:json)?\s*", "", inner)
-    inner = re.sub(r"\s*```$", "", inner).strip()
-    candidates = []
+def _repair_json(text):
+    """Automatically salvage a broken JSON object/array using the failure
+    patterns enumerated in <BAD_EXAMPLES>:
+      - stray leading/trailing square brackets   ({...}]  /  [{...})
+      - trailing commas                           {"a":1,}  ...
+      - //-style comments inside the block        {...} // note
+      - missing closing brace                     {"a": {"b": 1}
+    Escaped-quote, raw-backslash and single-quote mistakes are intentionally
+    NOT repaired: any such "fix" can corrupt string CONTENT (e.g. an
+    apostrophe in "it's a test" or a slash in "https://..."), so those cases
+    are left untouched. Returns the parsed Python value, or None if nothing
+    could be salvaged."""
+    text = text.strip()
+    if not text:
+        return None
+    # Try as-is first.
     try:
-        obj = json.loads(inner)
-        candidates = [obj]
+        return json.loads(text)
     except json.JSONDecodeError:
-        # several JSON objects inside one block -> split by brace balance
-        for raw in _extract_json_objects(inner):
-            try:
-                candidates.append(json.loads(raw))
-            except json.JSONDecodeError:
-                log(f"[tools] invalid JSON fragment skipped: {raw[:120]}", level="WARN")
-    for obj in candidates:
-        if isinstance(obj, dict) and obj.get("name"):
-            calls.append({
-                "name": str(obj["name"]),
-                "arguments": json.dumps(obj.get("arguments") or {}, ensure_ascii=False),
-            })
+        pass
+
+    variants = [text]
+    t = text
+    # 1) Strip stray surrounding square brackets (allow repeats).
+    for _ in range(4):
+        nt = re.sub(r"^\s*\[\s*", "", t)
+        nt = re.sub(r"\s*\]\s*$", "", nt)
+        if nt == t:
+            break
+        t = nt
+        variants.append(t)
+    # 2) Remove top-level `//`-style comments, but ONLY outside string literals
+    #    (a `//` inside a value like "https://x" must be kept intact).
+    variants.append(_strip_line_comments(text))
+    # 3) Remove trailing commas before a closing brace/bracket or at the end.
+    t_tc = re.sub(r",\s*([}\]])", r"\1", text)
+    t_tc = re.sub(r",\s*$", "", t_tc)
+    variants.append(t_tc)
+    # 4) Close an unclosed trailing brace by appending the right number of }.
+    variants.append(_close_unclosed(text))
+    # 5) Combined: several fixes applied together (e.g. trailing comma AND an
+    #    unclosed brace in the same block).
+    variants.append(_close_unclosed(t_tc))
+
+    for v in variants:
+        if not v or not v.strip():
+            continue
+        try:
+            obj = json.loads(v)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        # Only accept a top-level object or array.
+        if isinstance(obj, (dict, list)):
+            return obj
+    # 6) Last resort: extract any individually-balanced object and parse it
+    #    directly (no recursion - a recursive call can never shrink the input).
+    for raw in _extract_json_objects(text):
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(obj, (dict, list)):
+            return obj
+    return None
+
+
+def _strip_line_comments(s):
+    """Remove `// ...` to end-of-line, but never inside a double-quoted JSON
+    string (so 'https://x' or 'rg -n //foo src/' keep their content)."""
+    out = []
+    i, n = 0, len(s)
+    in_str = esc = False
+    while i < n:
+        ch = s[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+        elif ch == "/" and i + 1 < n and s[i + 1] == "/":
+            # skip to end of line, but keep the newline itself
+            while i < n and s[i] != "\n":
+                i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _close_unclosed(s):
+    """Append enough closing braces to balance an object/array that the model
+    forgot to close (e.g. {'a': {'b': 1}  ->  {'a': {'b': 1}})."""
+    out = []
+    depth = 0
+    in_str = esc = False
+    for ch in s:
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+        elif ch in "{[":
+            depth += 1
+            out.append(ch)
+        elif ch in "}]":
+            if depth > 0:
+                depth -= 1
+            out.append(ch)
+        else:
+            out.append(ch)
+    return "".join(out) + ("}" * depth)
+
+
+def parse_tool_call_blocks(text):
+    """Parse tool calls from ALL <tc>...</tc> blocks, recognising BOTH the
+    primary <tc> wrapper and the legacy <tool_call>/<tool_call> pairs.
+    Each block may hold ONE or SEVERAL consecutive JSON objects. Parallel
+    calls can therefore be written either as several objects inside ONE block
+    OR as several separate blocks - both are collected.This way a broken object
+    in one block doesn't take down the other calls (streaming-friendly)."""
+    calls = []
+    blocks = list(re.finditer(r"<(?:tc|tool_call)>\s*([\s\S]*?)\s*</(?:tc|tool_call)>", text))
+    for m in blocks:
+        inner = m.group(1).strip()
+        inner = re.sub(r"^```(?:json)?\s*", "", inner)
+        inner = re.sub(r"\s*```$", "", inner).strip()
+        candidates = []
+        try:
+            obj = json.loads(inner)
+            candidates = [obj]
+        except json.JSONDecodeError:
+            # Multiple balanced top-level objects inside THIS block = parallel
+            # calls -> handle each separately (a whole-block repair would only
+            # recover the first one).
+            objs = _extract_json_objects(inner)
+            used_objs = False
+            if len(objs) > 1:
+                for raw in objs:
+                    fixed = _repair_json(raw)
+                    if fixed is not None and isinstance(fixed, dict):
+                        candidates.append(fixed)
+                        used_objs = True
+                    else:
+                        try:
+                            candidates.append(json.loads(raw))
+                            used_objs = True
+                        except json.JSONDecodeError:
+                            log(f"[tools] invalid JSON fragment skipped: {raw[:120]}", level="WARN")
+            if not used_objs:
+                # Single (possibly broken) object/array -> auto-repair the block.
+                repaired = _repair_json(inner)
+                if repaired is not None:
+                    if isinstance(repaired, list):
+                        candidates = repaired
+                    else:
+                        candidates = [repaired]
+        for obj in candidates:
+            if isinstance(obj, dict) and obj.get("name"):
+                calls.append({
+                    "name": str(obj["name"]),
+                    "arguments": json.dumps(obj.get("arguments") or {}, ensure_ascii=False),
+                })
     return calls
 
 
@@ -455,11 +608,14 @@ parse_ml_tool_calls = parse_tool_call_blocks
 
 
 class ToolStreamBuffer:
-    """Streams visible text, captures <tc>{json}</tc> blocks
-    and converts them to OpenAI tool_calls.
+    """Streams visible text, captures <tc>{json}</tc> blocks (and the legacy
+    <tool_call>{json}</tool_call> form) and converts them to OpenAI tool_calls.
     If a captured block turns out not to be a valid tool call
     (e.g. '<tc>' mentioned in prose/code), its text is released back
     to the output so nothing is lost."""
+
+    OPEN_TAGS = ("<tc>", "<tool_call>")
+    CLOSE_TAGS = ("</tc>", "</tool_call>")
 
     def __init__(self):
         self.buf = ""
@@ -473,7 +629,9 @@ class ToolStreamBuffer:
 
         while True:
             if not self.capturing:
-                idx = self.buf.find("<tc>")
+                # locate the nearest opening tag of either kind
+                starts = [self.buf.find(t) for t in self.OPEN_TAGS if self.buf.find(t) != -1]
+                idx = min(starts) if starts else -1
                 if idx == -1:
                     # emit everything except a potentially partial trailing tag
                     hold = self._partial_hold_len()
@@ -488,10 +646,14 @@ class ToolStreamBuffer:
                 self.buf = self.buf[idx:]
                 self.capturing = True
 
-            end = self.buf.find("</tc>")
-            if end == -1:
+            ends = [self.buf.find(t) for t in self.CLOSE_TAGS if self.buf.find(t) != -1]
+            if not ends:
                 break  # wait for more data inside the block
-            block_end = end + len("</tc>")
+            end = min(ends)
+            # use the length of whichever closing tag actually matched
+            matched_close = [t for t in self.CLOSE_TAGS if self.buf.find(t) == end]
+            close_len = len(matched_close[0]) if matched_close else len(self.CLOSE_TAGS[0])
+            block_end = end + close_len
             block = self.buf[:block_end]
             self.buf = self.buf[block_end:]
             self.capturing = False
@@ -505,8 +667,8 @@ class ToolStreamBuffer:
         return visible_out, completed
 
     def _partial_hold_len(self):
-        """If buffer ends with a prefix of '<tc>' or '</tc>', hold it back."""
-        for marker in ("<tc>", "</tc>"):
+        """If buffer ends with a prefix of any opening/closing tag, hold it back."""
+        for marker in self.OPEN_TAGS + self.CLOSE_TAGS:
             max_check = min(len(marker) - 1, len(self.buf))
             for l in range(max_check, 0, -1):
                 if marker.startswith(self.buf[-l:]):
@@ -895,10 +1057,11 @@ class ZaiSession:
                 for tc in m.get("tool_calls") or []:
                     fn = tc.get("function") or {}
                     raw_args = fn.get("arguments", {})
-                    try:
-                        args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                    except (json.JSONDecodeError, TypeError):
-                        args = {"_raw": str(raw_args)}
+                    if isinstance(raw_args, str):
+                        repaired = _repair_json(raw_args)
+                        args = repaired if isinstance(repaired, dict) else {"_raw": str(raw_args)}
+                    else:
+                        args = raw_args or {}
                     calls.append({"name": fn.get("name", "unknown"), "arguments": args})
                 if calls:
                     line["tool_calls"] = calls
