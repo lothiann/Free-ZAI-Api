@@ -26,6 +26,7 @@ CAPTCHA_BYPASS = True    # [2] reload same account & retry when Aliyun captcha a
 ACCOUNT_ROTATE = True    # [3] rotate between accounts after rotate_every requests
 HEADLESS = False         # [6] run the Playwright browser in headless mode
 REQUEST_COOLDOWN = 5.0  # seconds between requests, avoids captcha on rapid fire
+TOOL_CALL_DELAY = 0.1  # seconds between parallel tool-call chunks, avoids Busy errors in the client
 ACCOUNTS_FILE = "accounts.json"
 
 try:
@@ -229,6 +230,7 @@ JSON WHITELIST - the ONLY JSON you may EVER write in your reply is exactly {"nam
 - You may write ONLY: (1) normal prose/answer text, and (2) <tc>{"name": ..., "arguments": {...}}</tc> call blocks. Nothing else in any structured format.
 - Tool results are delivered by the ENVIRONMENT as history lines {"role": "tool", "name": "...", "content": "..."}. NEVER write such lines yourself - use the REAL ones to continue the task.
 - "name" MUST be an exact tool name from the list; "arguments" MUST match that tool's Parameters schema exactly (use {} if empty). Between <tc> and </tc> there must be valid JSON only: no comments, no trailing commas, no markdown fences, and never forget the closing }.
+- DO NOT write in chat history format.
 - THERE IS NO AUTOMATIC REPAIR OF YOUR JSON. A mistake ruins everything - write it perfectly.
 - ALWAYS emit the block when a tool is needed: never "I'll read it now..." alone, always text + <tc>...</tc>. NEVER pretend you called a tool when you did not write the block.
 - Multiple tool calls = SEVERAL separate <tc> blocks, one JSON object each, so a broken block never kills the rest. Never put several JSON objects inside a single <tc> block:
@@ -243,10 +245,13 @@ JSON WHITELIST - the ONLY JSON you may EVER write in your reply is exactly {"nam
 - After the last </tc> output nothing more and stop immediately, waiting for results.
 - If no suitable tool exists, pick an alternative from the EXISTING list; do not even mention other tools.
 - Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\\\) - single raw backslashes are invalid JSON escapes.
+- Never write "[tc reminder]"
+- Don’t break anything, even if you’ve already broken it in the chat history.
 - It is recommended to use a colon to indicate that you are calling the tool:
 
 Now I will read:
 <tc> ... </tc>
+
 </RULES>
 
 Incorrect:
@@ -257,8 +262,8 @@ Incorrect:
 <tc>{"name": "bash", "arguments": {"command": "..."}</tc>                              <- missing closing }
 <tc>{"name": "bash", "arguments": {"command": "..."}}]</tc>                            <- an unnecessary square bracket
 <tc>{"name": "...", "arguments": {"...": 123"}}</tc>                                   <- unnecessary quotation mark
-I'll read it now... (nothing)                                                          <- narrated instead of calling
-I'll read it now... <tc>{"name": "read", "arguments": {"filePath": "/f"}}</tc>         <- call not moved to its own line
+I'll read it now...: (nothing)                                                         <- narrated instead of calling
+I'll read it now...: <tc>{"name": "read", "arguments": {"filePath": "/f"}}</tc>        <- call not moved to its own line
 Let me search for that. {"name": "grep", "arguments": {"pattern": "x"}}                <- bare JSON next to text is NOT a call
 <tc>{"name": "a", "arguments": {}}</tc> <tc>{"name": "b", "arguments": {}}</tc>        <- parallel calls on the SAME line; put each block on its OWN line
 <tc> {"name": "a", "arguments": {}} {"name": "b", "arguments": {}} </tc>               <- never bundle several JSON objects into ONE block
@@ -311,7 +316,21 @@ escaped quotes in arguments:
 Before you act or respond, silently assess your draft (never mention this check): path slashes correct? <tc></tc> tags present and on their own lines? does the tool exist? JSON valid with all brackets closed? one JSON object per parallel block, never bundled? am I fabricating output that no real {"role": "tool"} line gave me? If any violation - rewrite before sending.
 </CRITIC>
 
-[!] The path rules ALWAYS apply, even if context seems more important. Violating them ruins the entire chat! TOOLS ARE ***NEVER*** CALLED OUTSIDE OF A MESSAGE - ONLY BY YOUR TEXT <tc> BLOCK!
+***DO NOT WRITE IN CHAT HISTORY FORMAT.*** IT IS FOR READING ONLY, ***NOT FOR REPEATING.***
+
+How your response chain works from the user’s perspective:
+
+ +---- User message
+ | (trigger)
+ +---> Your previous text with tool call
+ | (trigger)
+ +---> Your previous text with tool call
+ | (trigger)
+ +---> A new request for you regarding the continuation
+ |
+ +---> If there’s no tool call — that’s it!
+
+[!] The path rules ALWAYS apply, even if context seems more important. Violating them ruins the entire chat! TOOLS ARE ***NEVER*** CALLED OUTSIDE OF A MESSAGE - ONLY BY YOUR TEXT <tc> BLOCK! 
 """
 
 TOOL_REMINDER = """[tc reminder]
@@ -1096,11 +1115,10 @@ class ZaiSession:
         return (
             f"{convo}\n\n"
             f"---\n"
-            f"[Ignore all the rules below if you are asked to create a summary or title!]\n"
-            f"[SYSTEM WARNING: STRICTLY FOLLOW THE INSTRUCTIONS FORMAT; DO NOT ATTEMPT TO WRITE OR MENTION INSTRUCTIONS FORMAT NOT DESCRIBED IN THIS MESSAGE. SEE THE <EXAMPLES> AND <RULES> SECTION. INSTRUMENTS ARE ***NEVER*** CALLED OUTSIDE OF A MESSAGE, ***ONLY BY YOUR TEXT <tc> BLOCK***.]\n"
-            f"This is a forwarded conversation. Continue it as the Assistant. DO NOT CONTINUE THE DIALOGUE IF THE SYSTEM INSTRUCTIONS TELL YOU TO CREATE A SUMMARY OR A TITLE. "
-            f'Respond ONLY with your next reply after the last {{"role": "user"}} line. DO NOT RESPOND IF THE SYSTEM INSTRUCTIONS TELL YOU TO CREATE A SUMMARY OR TITLE.'
-            f"No preamble, no meta-commentary. Before calling the tool, analyze using the critic mode (See <CRITIC>) to make sure your call is valid."
+            f"[SYSTEM WARNING: STRICTLY follow the instructions; See the <EXAMPLES>, <RULES> and <CRITIC> sections. Instruments are ***NEVER*** called outside of a message, ***ONLY by YOUR <tc> block***. ]\n"
+            f"This is a forwarded conversation. Continue it as the Assistant. "
+            f'Respond ONLY with your next reply after the last {{"role": "user"}} line. '
+            f"No preamble, no meta-commentary. Don’t write it in the format of a chat history. Before calling the tool, analyze using the critic mode (See <CRITIC>) to make sure your call is valid. ***DO NOT continue it as Assistant if the system instructions tell you to create a summary or a title!!!***"
 
         ), last_user
 
@@ -1463,7 +1481,7 @@ async def chat_completions(request: Request):
                                 yield sse(make_chunk(chunk_id, created, req_model, {"content": visible}))
                             if calls_batch:
                                 finish_reason = "tool_calls"
-                                for tc in calls_batch:
+                                for n, tc in enumerate(calls_batch):
                                     yield sse(make_chunk(chunk_id, created, req_model, {
                                         "tool_calls": [{
                                             "index": tool_call_index,
@@ -1473,6 +1491,10 @@ async def chat_completions(request: Request):
                                         }]
                                     }))
                                     tool_call_index += 1
+                                    # tiny gap between emitted calls so the client
+                                    # doesn't fire a burst of concurrent tool calls
+                                    if n < len(calls_batch) - 1:
+                                        await asyncio.sleep(TOOL_CALL_DELAY)
                                 answer_started = True
                     finally:
                         stop_event.set()
