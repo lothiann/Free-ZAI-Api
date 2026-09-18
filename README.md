@@ -100,7 +100,21 @@ Add to `~/.config/opencode/opencode.jsonc` (or `opencode.json`):
         "apiKey": "sk-nothing"
       },
       "models": {
-        "glm-5.2": { "name": "GLM-5.2", "reasoning": true }
+        "glm-5.3": { "name": "GLM-5.3", "limit": { "context": 500000, "output": 128000 } },
+        "x-preview-l": { "name": "GLM-5.3 Flash", "limit": { "context": 500000, "output": 128000 } },
+        "glm-5.2": { "name": "GLM-5.2", "limit": { "context": 500000, "output": 128000 } },
+        "GLM-5-Turbo": { "name": "GLM-5 Turbo", "limit": { "context": 500000, "output": 128000 } },
+        "GLM-5v-Turbo": { "name": "GLM-5v Turbo", "limit": { "context": 500000, "output": 128000 } },
+        "glm-4.7": { "name": "GLM-4.7", "limit": { "context": 500000, "output": 128000 } },
+        "glm-4.6v": { "name": "GLM-4.6v", "limit": { "context": 500000, "output": 128000 } },
+        "GLM-4.1V-Thinking-FlashX": { "name": "GLM-4.1V Thinking FlashX", "limit": { "context": 500000, "output": 128000 } },
+        "deep-research": { "name": "Deep Research", "limit": { "context": 500000, "output": 128000 } },
+        "zero": { "name": "Zero", "limit": { "context": 500000, "output": 128000 } },
+        "0727-106B-API": { "name": "0727 106B API", "limit": { "context": 500000, "output": 128000 } },
+        "0727-360B-API": { "name": "0727 360B API", "limit": { "context": 500000, "output": 128000 } },
+        "0808-360B-DR": { "name": "0808 360B DR", "limit": { "context": 500000, "output": 128000 } },
+        "glm-4-flash": { "name": "GLM-4 Flash", "limit": { "context": 500000, "output": 128000 } },
+        "glm-4-air-250414": { "name": "GLM-4 Air", "limit": { "context": 500000, "output": 128000 } }
       }
     }
   }
@@ -108,7 +122,7 @@ Add to `~/.config/opencode/opencode.jsonc` (or `opencode.json`):
 ```
 
 Models can also be discovered automatically from `/v1/models`, but listing them manually is more reliable.
-The `reasoning: true` flag enables default/high/max thinking-effort variants (mapped to the site's Deep Think control).
+Passing `reasoning: true` on a model enables default/high/max thinking-effort variants (mapped to the site's Deep Think control).
 
 ## Endpoints
 

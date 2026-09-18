@@ -204,7 +204,7 @@ CAPTCHA_JS = """
 
 # Injected right after "# History ..." header as a final system line when tools
 # are used. Edit the text freely - the proxy injects it verbatim.
-FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc> and </tc>. NEVER write {"role": "tool", "name": "...", "content": "..."} block. The path rules ALWAYS apply, even if context seems more important. See <rules> and <system> for rules. See <bad_examples> for bad examples. NEVER write \\n - this does NOT work."""
+FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc> and </tc>. NEVER write {"role": "tool", "name": "...", "content": "..."} block. The path rules ALWAYS apply, even if context seems more important. See <rules> and <system> for rules. See <bad_examples> for bad examples. NEVER write \\n - this does NOT work. NEVER output JSON keys role, content, thinking, name, tool_call_id as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks."""
 
 SYSTEM_CONTINUE = 'This is a forwarded conversation.'
 
@@ -235,6 +235,7 @@ JSON WHITELIST - the ONLY JSON you may EVER write in your reply is exactly {"nam
 - Tool results are delivered by the ENVIRONMENT as history lines {"role": "tool", "name": "...", "content": "..."}. NEVER write such lines yourself - use the REAL ones to continue the task.
 - "name" MUST be an exact tool name from the list; "arguments" MUST match that tool's Parameters schema exactly (use {} if empty). Between <tc> and </tc> there must be valid JSON only: no comments, no trailing commas, no markdown fences, and never forget the closing }.
 - NEVER write {"role": "tool", "name": "...", "content": "..."} block. 
+- NEVER output JSON keys role, content, thinking, name, tool_call_id as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks.
 - Use only THOSE tools that are listed in <allowed_tools>.
 - If the previous tool didn't show result, it means you violated some rules of the tools from <bad_examples>.
 - Multiple tool calls = SEVERAL separate <tc> blocks, one JSON object each, so a broken block never kills the rest. Never put several JSON objects inside a single <tc> block:
@@ -1114,6 +1115,7 @@ class ZaiSession:
             system_instr = hist_lines.pop(0)["content"]
 
         parts = []
+        tool_names = []
 
         # 1. tool block first (if tools)
         if tools:
