@@ -100,21 +100,21 @@ Add to `~/.config/opencode/opencode.jsonc` (or `opencode.json`):
         "apiKey": "sk-nothing"
       },
       "models": {
-        "glm-5.3": { "name": "GLM-5.3", "limit": { "context": 500000, "output": 128000 } },
-        "x-preview-l": { "name": "GLM-5.3 Flash", "limit": { "context": 500000, "output": 128000 } },
-        "glm-5.2": { "name": "GLM-5.2", "limit": { "context": 500000, "output": 128000 } },
-        "GLM-5-Turbo": { "name": "GLM-5 Turbo", "limit": { "context": 500000, "output": 128000 } },
-        "GLM-5v-Turbo": { "name": "GLM-5v Turbo", "limit": { "context": 500000, "output": 128000 } },
-        "glm-4.7": { "name": "GLM-4.7", "limit": { "context": 500000, "output": 128000 } },
-        "glm-4.6v": { "name": "GLM-4.6v", "limit": { "context": 500000, "output": 128000 } },
-        "GLM-4.1V-Thinking-FlashX": { "name": "GLM-4.1V Thinking FlashX", "limit": { "context": 500000, "output": 128000 } },
-        "deep-research": { "name": "Deep Research", "limit": { "context": 500000, "output": 128000 } },
-        "zero": { "name": "Zero", "limit": { "context": 500000, "output": 128000 } },
-        "0727-106B-API": { "name": "0727 106B API", "limit": { "context": 500000, "output": 128000 } },
-        "0727-360B-API": { "name": "0727 360B API", "limit": { "context": 500000, "output": 128000 } },
-        "0808-360B-DR": { "name": "0808 360B DR", "limit": { "context": 500000, "output": 128000 } },
-        "glm-4-flash": { "name": "GLM-4 Flash", "limit": { "context": 500000, "output": 128000 } },
-        "glm-4-air-250414": { "name": "GLM-4 Air", "limit": { "context": 500000, "output": 128000 } }
+        "glm-5.3": { "name": "GLM-5.3", "limit": { "context": 2000000, "output": 2000000 } },
+        "x-preview-l": { "name": "GLM-5.3 Flash", "limit": { "context": 2000000, "output": 2000000 } },
+        "glm-5.2": { "name": "GLM-5.2", "limit": { "context": 2000000, "output": 2000000 } },
+        "GLM-5-Turbo": { "name": "GLM-5 Turbo", "limit": { "context": 2000000, "output": 2000000 } },
+        "GLM-5v-Turbo": { "name": "GLM-5v Turbo", "limit": { "context": 2000000, "output": 2000000 } },
+        "glm-4.7": { "name": "GLM-4.7", "limit": { "context": 2000000, "output": 2000000 } },
+        "glm-4.6v": { "name": "GLM-4.6v", "limit": { "context": 2000000, "output": 2000000 } },
+        "GLM-4.1V-Thinking-FlashX": { "name": "GLM-4.1V Thinking FlashX", "limit": { "context": 2000000, "output": 2000000 } },
+        "deep-research": { "name": "Deep Research", "limit": { "context": 2000000, "output": 2000000 } },
+        "zero": { "name": "Zero", "limit": { "context": 2000000, "output": 2000000 } },
+        "0727-106B-API": { "name": "0727 106B API", "limit": { "context": 2000000, "output": 2000000 } },
+        "0727-360B-API": { "name": "0727 360B API", "limit": { "context": 2000000, "output": 2000000 } },
+        "0808-360B-DR": { "name": "0808 360B DR", "limit": { "context": 2000000, "output": 2000000 } },
+        "glm-4-flash": { "name": "GLM-4 Flash", "limit": { "context": 2000000, "output": 2000000 } },
+        "glm-4-air-250414": { "name": "GLM-4 Air", "limit": { "context": 2000000, "output": 2000000 } }
       }
     }
   }
@@ -137,6 +137,7 @@ Passing `reasoning: true` on a model enables default/high/max thinking-effort va
 - Each request opens a fresh site chat; full conversation history is forwarded as a single prompt.
 - Reasoning is streamed via `delta.reasoning_content`, the answer via `delta.content`.
 - Tool calls require the client to send standard OpenAI `tools`; results come back as `role: "tool"` messages.
+- `usage` counts **characters** (1 token := 1 char), matching the site's ~2M real limit — set the model limit in your client accordingly (e.g. `context: 2000000`).
 - Logs are written to `logs/`, the last raw response to `last_response.json`.
 
 ## Disclaimer
