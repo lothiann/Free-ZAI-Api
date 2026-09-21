@@ -22,15 +22,12 @@ PORT = 8492
 FALLBACK_MODEL = "glm-5.2"
 
 # ===== STARTUP MENU STATE (toggled from the console before launch) =====
-CAPTCHA_BYPASS = True    # [2] reload same account & retry when Aliyun captcha appears
-ACCOUNT_ROTATE = True    # [3] rotate between accounts after rotate_every requests
-HEADLESS = True           # [6] hide the browser window (True = hidden, default on)
-REQUEST_COOLDOWN = 5.0  # seconds between requests, avoids captcha on rapid fire
-TOOL_CALL_DELAY = 0.5  # seconds between parallel tool-call chunks, avoids Busy errors in the client
-CAPTCHA_RELOAD_ATTEMPTS = 3      # reload attempts inside reload_current() before failing
-CAPTCHA_RELOAD_READY_TIMEOUT = 30  # seconds to wait for the page to become ready per attempt
-CAPTCHA_RELOAD_BACKOFF = 5.0     # seconds between reload attempts
-MAX_REQUEST_RETRIES = 4          # max captcha/fetch retries per request before giving up
+CAPTCHA_BYPASS = True              # [2] reload same account & retry when Aliyun captcha appears
+ACCOUNT_ROTATE = True              # [3] rotate between accounts after rotate_every requests
+HEADLESS = True                    # [6] hide the browser window (True = hidden, default on)
+REQUEST_COOLDOWN = 0               # seconds between requests, avoids captcha on rapid fire
+TOOL_CALL_DELAY = 0.5              # seconds between parallel tool-call chunks, avoids Busy errors in the client
+MAX_REQUEST_RETRIES = 4            # max captcha/fetch retries per request before giving up
 ACCOUNTS_FILE = "accounts.json"
 
 try:
@@ -234,51 +231,49 @@ CAPTCHA_JS = """
 
 # Injected right after "# History ..." header as a final system line when tools
 # are used. Edit the text freely - the proxy injects it verbatim.
-FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc> and </tc>. NEVER write {"role": "tool", "name": "...", "content": "..."} block. The path rules ALWAYS apply, even if context seems more important. NEVER write anything after <tc> block. <tc> block must ALWAYS be at the end of your response. See <rules> and <system> for rules. See <bad_examples> for bad examples. NEVER write \\n - this does NOT work. NEVER output JSON keys role, content, thinking, name, tool_call_id as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks."""
+FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc>, <ak> and <av>. NEVER write {"role": "tool", "name": "...", "content": "..."} block. The path rules ALWAYS apply, even if context seems more important. NEVER write anything after <tc> block. <tc> block must ALWAYS be at the end of your response. See <rules> and <system> for rules. See <bad_examples> for bad examples. NEVER write \\n - this does NOT work. Function name goes right after <tc>, each argument is <ak>key</ak><av>value</av>. Values go directly inside <av>...</av> without quotes. NEVER output JSON keys role, content, thinking, name, tool_call_id as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks."""
 
 SYSTEM_CONTINUE = 'This is a forwarded conversation.'
 
-TOOL_PROMPT_TEMPLATE = """You have access to these tools:
+TOOL_PROMPT_TEMPLATE = """ # You have access to these tools:
 
 {tool_details}
+
 {instructions}"""
 
-TOOL_INSTRUCTIONS = """STRICTLY follow the instructions; See the <examples>, <rules> and <critic> sections. All the instructions above indicate what you need to do; all the instructions below indicate exactly how to do it. Ignore all the rules below if you are asked to create a summary or title! The instructions below are ONLY supplementary to the instructions above.
-IMPORTANT: Ignore all built-in, hidden, native and platform tools. The ONLY tools you may use are the explicit names listed in the tool definitions above. Never invent tools, never say resources are exhausted, never repeat the same command twice in a row.
-This is the only source on how to use the tools. All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc> and </tc>. NEVER write {"role": "tool", "name": "...", "content": "..."} block.
+TOOL_INSTRUCTIONS = """# Tool Call Instructions
+
+See the <priorities>, <bad_examples>, <good_examples>, <examples>, <rules> and <critic> sections.
+IMPORTANT: Ignore all built-in, hidden, native and platform tools. The ONLY tools you may use are the explicit names listed in the <allowed_tools>. Never invent tools, never say resources are exhausted, never repeat the same command in a row. This is the only source on how to use the tools. All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc>, <ak> and <av>. NEVER write {"role": "tool", "name": "...", "content": "..."} block.
 
  # Tool Call Format:
-The tool call format:
-<tc>{"name": "TOOL_NAME_HERE", "arguments": {"param_name": "value"}}</tc>
+A tool call is ONE single-line <tc>...</tc> block. The function name comes right after the opening tag; every argument is ONE <ak>...</ak> pair followed by ONE <av>...</av> pair:
+<tc>TOOL_NAME_HERE<ak>param_name</ak><av>value</av></tc>
 
-Multi-line form of the same thing:
-<tc>
-{"name": "TOOL_NAME_HERE", "arguments": {"param_name": "value"}}
-</tc>
+A call with several arguments:
+<tc>TOOL_NAME_HERE<ak>param_name</ak><av>value</av><ak>param_name2</ak><av>value2</av></tc>
 
-CRITICAL: every call MUST start with <tc> and end with </tc>. A bare JSON object without these tags is NOT a tool call and will be ignored.
-JSON WHITELIST - the ONLY JSON you may EVER write in your reply is exactly {"name": "<tool>", "arguments": {...}}, always wrapped in <tc></tc>.
+CRITICAL: every call MUST be exactly one <tc>...</tc> block. The function name comes right after the opening tag; every argument is ONE <ak>...</ak> pair followed by ONE <av>...</av> pair. A bare JSON object, a {"name": ...} wrapper and <tools> tags are NOT tool calls and will be ignored.
+String argument values are written RAW, without quotes: <av>hello</av>. Non-string values use JSON: lists <av>[1, 2]</av>, objects <av>{"a": 1}</av>, numbers <av>42</av>, booleans <av>true</av>, null <av>null</av>. If the tool takes no arguments, write only the name: <tc>clear</tc>.
 
 <rules>
  # Rules:
-- You may write ONLY: (1) normal prose/answer text, and (2) <tc>{"name": ..., "arguments": {...}}</tc> call blocks. Nothing else in any structured format.
-- Tool results are delivered by the ENVIRONMENT as history lines {"role": "tool", "name": "...", "content": "..."}. NEVER write such lines yourself - use the REAL ones to continue the task.
-- "name" MUST be an exact tool name from the list; "arguments" MUST match that tool's Parameters schema exactly (use {} if empty). Between <tc> and </tc> there must be valid JSON only: no comments, no trailing commas, no markdown fences, and never forget the closing }.
+- You may write ONLY: (1) normal prose/answer text, and (2) <tc>...</tc> blocks. Nothing else in any structured format.
+- Tool results are delivered by the ENVIRONMENT as history lines {"role": "tool", "name": "...", "content": "<tool_response>...</tool_response>"}. 
+- The function name MUST be an exact tool name from the list; argument keys MUST match that tool's Parameters schema exactly. Every <ak> MUST be followed by its <av>.
+- DONT use <tool_call>, <arg_key>, <arg_value>. In this tool call format: <tool_call> is <tc>, <arg_key> is <ak>, <arg_value> is <av>.
 - NEVER write {"role": "tool", "name": "...", "content": "..."} block. 
 - NEVER output JSON keys role, content, thinking, name, tool_call_id as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks.
 - Use only THOSE tools that are listed in <allowed_tools>.
 - If the previous tool didn't show result, it means you violated some rules of the tools from <bad_examples>.
-- Multiple tool calls = SEVERAL separate <tc> blocks, one JSON object each, so a broken block never kills the rest. Never put several JSON objects inside a single <tc> block:
+- Multiple tool calls = SEVERAL separate <tc> blocks, one tool call per block, so a broken block never kills the rest:
 
-<tc>
-{"name": "TOOL_NAME_HERE1", "arguments": {"param_name": "value"}}
-</tc>
-<tc>
-{"name": "TOOL_NAME_HERE2", "arguments": {"param_name": "value"}}
-</tc>
+<tc>TOOL_NAME_HERE1<ak>param_name1</ak><av>value1</av></tc>
+<tc>TOOL_NAME_HERE2<ak>param_name2</ak><av>value2</av></tc>
 
 - If no suitable tool exists, pick an alternative from the EXISTING list; do not even mention other tools.
-- Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\\\) - single raw backslashes are invalid JSON escapes.
+- Paths: use forward slashes / (recommended). If you must use backslashes, double them (\\) - raw backslashes no longer break anything, but keep writing them doubled.
+- Raw inner quotes in string values are fine, they are plain text inside <av>: <av>rg -n "pattern" src/</av>.
 - Don't break anything, even if you've already broken it in the chat history.
 - Don't write "The user reported ..." and similar phrases.
 - NEVER write anything after <tc> block. <tc> block must ALWAYS be at the end of your response.
@@ -286,74 +281,63 @@ JSON WHITELIST - the ONLY JSON you may EVER write in your reply is exactly {"nam
 - It is recommended to use a colon to indicate that you are calling the tool:
 
 Now I will read:
-<tc> ... </tc>
+<tc>read<ak>filePath</ak><av>/project/file.txt</av></tc>
 
 </rules>
 
  # Incorrect:
 <bad_examples>
-{"role": "assistant", "content": ...                                                   <- "assistant" should NEVER be written
-{"role": "assistant", "content": "..."}                                                <- "assistant" should NEVER be written
-{"role": "tool", "name": "...", "content": "..."}                                      <- "tool" should NEVER be written
-{"name": "bash", "arguments": {"command": "..."}}                                      <- bare JSON without <tc></tc> wrapper
-<tc>{"name": "bash", "arguments": {"command": "..."}}                                  <- missing closing </tc>
-{"name": "bash", "arguments": {"command": "dir"}}</tc>                                 <- missing opening <tc>
-<tc>{"name": "bash", "arguments": {"command": "..."}</tc>                              <- missing closing }
-<tc>{"name": "bash", "arguments": {"command": "..."}}]</tc>                            <- an unnecessary square bracket
-<tc>{"name": "...", "arguments": {"...": 123"}}</tc>                                   <- unnecessary quotation mark
-I'll read it now...: (nothing)                                                         <- narrated instead of calling
-I'll read it now...: <tc>{"name": "read", "arguments": {"filePath": "/f"}}</tc>        <- call not moved to its own line
-Let me search for that. {"name": "grep", "arguments": {"pattern": "x"}}                <- bare JSON next to text is NOT a call
-<tc>{"name": "a", "arguments": {}}</tc> <tc>{"name": "b", "arguments": {}}</tc>        <- parallel calls on the SAME line; put each block on its OWN line
-<tc> {"name": "a", "arguments": {}} {"name": "b", "arguments": {}} </tc>               <- never bundle several JSON objects into ONE block
-<tool_call>...</tool_call>; <arg_value>...</arg_value>; search.todowrite, readfilePath <- non-existent blocks/tools
-<tc>{"name": "bash", "arguments": {"command": "rg -n "p" src/"}}</tc>                  <- raw inner quotes break JSON; escape them as \\"
-<tc>{"name": "...", 'arguments': {"..."}}</tc>                                         <- single quotes are invalid JSON
-<tc>{"name": "...", "arguments": {"filePath": "\\Project\\file.h"}}</tc>               <- raw backslashes are invalid JSON escapes
-<tc>{"name": "...", "arguments": {}} // fetch it</tc>                                  <- no comments inside the block
-<tc>{"name": "...", "arguments": {},}</tc>                                             <- no trailing comma
-<tc>{"name": "TOOL_NAME_HERE", "arguments": {"param_name": "value"}}</tc>              <- replace placeholders with real values
-{"tool_calls": [{"name": "a"}, {"name": "b"}]}                                         <- array-wrapper format does not exist here
+<tool_call>bash<arg_key>command</arg_key><arg_value>dir</arg_value></tool_call>   <- native GLM tags get stripped by site, use <tc>/<ak>/<av>
+<tc>bash<ak>command</ak></tc>                                                     <- missing </av>
+<tc>bash<av>dir</av></tc>                                                         <- missing <ak>
+<tc>bash<ak>command</ak><av>dir</tc>                                              <- missing closing </av>
+<tc><ak>command</ak><av>dir</av></tc>                                             <- missing function name
+<tc>bash<ak>command</ak><av>"dir"</av></tc>                                       <- values must not be JSON-quoted
+I'll read it now...: (nothing)                                                    <- narrated instead of calling
+<tc>bash<ak>command</ak><av>rg -n "p</av></tc>                                    <- unterminated value
 </bad_examples>
 
  # Correct:
 <good_examples>
 single call - brief prose if needed, then ONE block on its own line, then STOP completely:
 Let me read that file.
-<tc>{"name": "read", "arguments": {"filePath": "/project/file.txt"}}</tc>
+<tc>read<ak>filePath</ak><av>/project/file.txt</av></tc>
 
-parallel calls - SEVERAL separate blocks, one JSON object per block, stop right after:
-<tc>
-{"name": "glob", "arguments": {"pattern": "**/*.ts"}}
-</tc>
-<tc>
-{"name": "grep", "arguments": {"pattern": "TODO"}}
-</tc>
+parallel calls - SEVERAL separate blocks, one tool call per block, stop right after:
+<tc>glob<ak>pattern</ak><av>**/*.ts</av></tc>
+<tc>grep<ak>pattern</ak><av>TODO</av></tc>
 
 / paths - recommended:
-<tc>{"name": "read", "arguments": {"filePath": "/Project/file.h"}}</tc>
+<tc>read<ak>filePath</ak><av>/Project/file.h</av></tc>
 
-escaped quotes in arguments:
-<tc>{"name": "bash", "arguments": {"command": "rg -n \\"pattern\\" src/"}}</tc>
+raw quotes in argument values:
+<tc>bash<ak>command</ak><av>rg -n "pattern" src/</av></tc>
+
+non-string values - lists, objects, numbers:
+<tc>todowrite<ak>todos</ak><av>[{"content": "make init", "status": "in_progress", "priority": "high"}, {"content": "make debug", "status": "pending", "priority": "medium"}]</av></tc>
 </good_examples>
 
 <examples>
  # Examples (*If you are running in the OpenCode CLI):
 
-<tc>{"name": "bash", "arguments": {"command": "git status --short"}}</tc>
-<tc>{"name": "read", "arguments": {"filePath": "project/main.py"}}</tc>
-<tc>{"name": "write", "arguments": {"filePath": "project/helper.py", "content": "def add(a, b):\\n    return a + b\\n"}}</tc>
-<tc>{"name": "edit", "arguments": {"filePath": "project/main.py", "oldString": "def old_fn():\\n    pass", "newString": "def new_fn():\\n    return True"}}</tc>
-<tc>{"name": "glob", "arguments": {"pattern": "**/*.cpp"}}</tc>
-<tc>{"name": "grep", "arguments": {"pattern": "MyClass", "path": "project/scripts"}}</tc>
-<tc>{"name": "list", "arguments": {"path": "project/"}}</tc>
-<tc>{"name": "todowrite", "arguments": {"todos": [{"content": "make init", "status": "in_progress", "priority": "high"}, {"content": "make debug", "status": "pending", "priority": "medium"}]}}</tc>
-<tc>{"name": "webfetch", "arguments": {"url": "https://example.com/docs", "format": "markdown"}}</tc>
+<tc>bash<ak>command</ak><av>git status --short</av></tc>
+<tc>read<ak>filePath</ak><av>project/main.py</av></tc>
+<tc>write<ak>filePath</ak><av>project/helper.py</av><ak>content</ak><av>def add(a, b):
+    return a + b
+</av></tc>
+<tc>edit<ak>filePath</ak><av>project/main.py</av><ak>oldString</ak><av>def old_fn():
+    pass</av><ak>newString</ak><av>def new_fn():
+    return True</av></tc>
+<tc>glob<ak>pattern</ak><av>**/*.cpp</av></tc>
+<tc>grep<ak>pattern</ak><av>MyClass</av><ak>path</ak><av>project/scripts</av></tc>
+<tc>list<ak>path</ak><av>project/</av></tc>
+<tc>todowrite<ak>todos</ak><av>[{"content": "make init", "status": "in_progress", "priority": "high"}, {"content": "make debug", "status": "pending", "priority": "medium"}]</av></tc>
+<tc>webfetch<ak>url</ak><av>https://example.com/docs</av><ak>format</ak><av>markdown</av></tc>
 
 </examples>
 
 <critic>
-Before you act or respond, silently assess your draft (never mention this check): path slashes correct? <tc></tc> tags present and on their own lines? does the tool exist? JSON valid with all brackets closed? one JSON object per parallel block, never bundled? am I fabricating output that no real {"role": "tool"} line gave me? If any violation - rewrite before sending.
+Before you act or respond, silently assess your draft (never mention this check): path slashes correct? <tc></tc> tags present and on their own lines? does the tool exist? function name placed right after <tc>? every <ak> followed by its <av>? strings written RAW, non-strings as JSON? one tool call per block, never bundled? am I fabricating output that no real {"role": "tool"} line gave me? If any violation - rewrite before sending.
 </critic>
 
 How your response chain works from the user’s perspective:
@@ -366,397 +350,107 @@ How your response chain works from the user’s perspective:
  | (trigger)
  +---> A new request for you regarding the continuation
  |
- +---> If there's no <tc> block — that's it!
+ +---> If there's no <tc> block — that's it!
 
 trigger - a new request for you to take the following action
 
 <priorities>
  # Priorities:
-1. The last role system message.
-2. The <system> messages.
-3. The <rules>
-4. User message
-</priorities>
-"""
+1. The <rules>
+2. The <bad_examples>, <good_examples> and <critic>
+5. The <examples>
+4. Purpose/User Message
+</priorities>"""
+
+
+def _glm_arg_value(v):
+    """Render one argument value: strings stay raw, everything else as JSON."""
+    if isinstance(v, str):
+        return v
+    return json.dumps(v, ensure_ascii=False)
+
+
+def tool_call_xml(name, arguments):
+    """History re-injection: OpenAI tool_call -> <tc>NAME<ak>K</ak><av>V</av></tc>."""
+    if not arguments:
+        return f"<tc>{name}</tc>"
+    inner = "".join(
+        f"<ak>{k}</ak><av>{_glm_arg_value(v)}</av>" for k, v in (arguments or {}).items()
+    )
+    return f"<tc>{name}{inner}</tc>"
+
+
+def _parse_glm_xml_call(inner):
+    """Parse XML tool call body:
+    NAME<ak>K</ak><av>V</av>... (keys/vals repeat)."""
+    keys = re.findall(r"<ak>([\s\S]*?)</ak>", inner)
+    vals = re.findall(r"<av>([\s\S]*?)</av>", inner)
+    if not keys or len(keys) != len(vals):
+        return None
+    name = re.split(r"<ak>", inner, maxsplit=1)[0].strip()
+    if not name:
+        return None
+    args = {}
+    for k, v in zip(keys, vals):
+        args[k.strip()] = _glm_arg_value(v)
+    return {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}
 
 
 def _strip_cdata(v):
     return re.sub(r"<!\[CDATA\[([\s\S]*?)\]\]>", r"\1", v)
 
 
-def _try_parse_json_value(v):
-    s = v.strip()
-    if not s:
-        return ""
-    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-        try:
-            return json.loads(s)
-        except json.JSONDecodeError:
-            return s
-    low = s.lower()
-    if low == "true":
-        return True
-    if low == "false":
-        return False
-    if low == "null":
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    return s
-
-
 def render_tools_block(tools):
-    blocks = []
-    for t in tools:
-        fn = t.get("function", {})
-        params = fn.get("parameters") or {}
-        blocks.append(
-            f"Tool: {fn.get('name')}\n"
-            f"Description: {fn.get('description') or 'No description'}\n"
-            f"Parameters: {json.dumps(params)}"
-        )
-    return "\n\n".join(blocks)
+    """Render the tool list literally as OpenAI-API style JSON: a {"tools": [...]}
+    array, each entry a {"type": "function", "function": {...}} object."""
+    return json.dumps({"tools": tools}, ensure_ascii=False, indent=2)
 
 
-def tool_calls_to_text(tool_calls):
-    """History re-injection: OpenAI tool_calls -> <tc> blocks."""
-    out = []
-    for tc in tool_calls or []:
-        fn = tc.get("function", {})
-        name = fn.get("name", "")
-        raw_args = fn.get("arguments")
-        if isinstance(raw_args, str):
-            repaired = _repair_json(raw_args)
-            if repaired is not None and isinstance(repaired, dict):
-                args = repaired
-            else:
-                args = {"input": raw_args}
-        elif isinstance(raw_args, dict):
-            args = raw_args
-        else:
-            args = {}
-        obj = json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
-        out.append(f"<tc>\n{obj}\n</tc>")
-    return "\n".join(out)
-
-
-def tool_result_to_text(call_id, name, content):
-    payload = json.dumps(
-        {"tool_call_id": call_id or "", "name": name or "", "content": str(content)},
-        ensure_ascii=False,
-    )
-    return f"<tc_result>\n{payload}\n</tc_result>"
-
-
-def _extract_json_objects(s):
-    """Extract top-level balanced {...} objects from a string."""
-    objs, depth, start = [], 0, None
-    in_str = esc = False
-    for i, ch in enumerate(s):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    objs.append(s[start:i + 1])
-                    start = None
-    return objs
-
-
-def _strip_stray_quotes(s):
-    """Remove quote characters that cannot legally START a JSON string at
-    their position. A quote is legal only right after a key/value context
-    opener (`{`, `[`, `:`, `,`) or at the very start; anywhere else it is a
-    stray that the model produced by accident (e.g. `"a": 123"}}` - a quote
-    after the value has nothing to open). Only quotes OUTSIDE real strings
-    are touched, so content inside strings (apostrophes, urls, escaped
-    quotes) is always preserved."""
-    out = []
-    i, n = 0, len(s)
-    in_str = esc = False
-    while i < n:
-        ch = s[i]
-        if in_str:
-            out.append(ch)
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            i += 1
-            continue
-        if ch == '"':
-            j = len(out) - 1
-            while j >= 0 and out[j] in " \t\r\n":
-                j -= 1
-            valid = j < 0 or out[j] in "{[:," 
-            if valid:
-                in_str = True
-                out.append(ch)
-            i += 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _repair_json(text):
-    """Automatically salvage a broken JSON object/array using the failure
-    patterns enumerated in <BAD_EXAMPLES>:
-      - stray leading/trailing square brackets   ({...}]  /  [{...})
-      - trailing commas                           {"a":1,}  ...
-      - //-style comments inside the block        {...} // note
-      - missing closing brace                     {"a": {"b": 1}
-    Escaped-quote, raw-backslash and single-quote mistakes are intentionally
-    NOT repaired: any such "fix" can corrupt string CONTENT (e.g. an
-    apostrophe in "it's a test" or a slash in "https://..."), so those cases
-    are left untouched. Returns the parsed Python value, or None if nothing
-    could be salvaged."""
-    text = text.strip()
-    if not text:
-        return None
-    # Try as-is first.
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    variants = [text]
-    t = text
-    # 1) Strip stray surrounding square brackets (allow repeats).
-    for _ in range(4):
-        nt = re.sub(r"^\s*\[\s*", "", t)
-        nt = re.sub(r"\s*\]\s*$", "", nt)
-        if nt == t:
-            break
-        t = nt
-        variants.append(t)
-    # 2) Remove top-level `//`-style comments, but ONLY outside string literals
-    #    (a `//` inside a value like "https://x" must be kept intact).
-    variants.append(_strip_line_comments(text))
-    # 3) Remove trailing commas before a closing brace/bracket or at the end.
-    t_tc = re.sub(r",\s*([}\]])", r"\1", text)
-    t_tc = re.sub(r",\s*$", "", t_tc)
-    variants.append(t_tc)
-    # 4) Remove stray quote characters outside strings (e.g. `123"}}`).
-    t_sq = _strip_stray_quotes(text)
-    variants.append(t_sq)
-    # 5) Close an unclosed trailing brace by appending the right number of }.
-    variants.append(_close_unclosed(text))
-    # 6) Combined: several fixes applied together (e.g. trailing comma AND an
-    #    unclosed brace in the same block).
-    variants.append(_close_unclosed(t_tc))
-    variants.append(_close_unclosed(t_sq))
-
-    for v in variants:
-        if not v or not v.strip():
-            continue
-        try:
-            obj = json.loads(v)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        # Only accept a top-level object or array.
-        if isinstance(obj, (dict, list)):
-            return obj
-    # 6) Last resort: extract any individually-balanced object and parse it
-    #    directly (no recursion - a recursive call can never shrink the input).
-    for raw in _extract_json_objects(text):
-        try:
-            obj = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if isinstance(obj, (dict, list)):
-            return obj
-    # 7) Optional json_repair library (lazy import - never a hard dependency).
-    #    Accept only if it did NOT invent new string content: every string we
-    #    keep must already appear in the input, so fabrication like guessing
-    #    "...a.ex" -> "...a.example." is rejected instead of corrupting a call.
-    for v in _repair_via_lib(text):
-        return v
-    return None
-
-
-def _repair_via_lib(s):
-    """Try the `json_repair` package (pip install json-repair) as a final fallback.
-    Guards against content fabrication by only returning parsed values whose
-    string leaves are all present in the original input."""
-    try:
-        from json_repair import repair_json
-    except Exception:
-        return []
-    try:
-        value = repair_json(s, return_objects=True)
-    except Exception:
-        return []
-    # avoid parsing a bare string/comment/number — we need an object or array
-    if not isinstance(value, (dict, list)):
-        return []
-    if _json_strings_preserved(s, value):
-        return [value]
-    return []
-
-
-def _json_strings_preserved(orig, obj):
-    """True if every string leaf in `obj` also appears in `orig`. Detects when
-    a repair library fabricated content that the model never emitted."""
-    stack = [obj]
-    while stack:
-        cur = stack.pop()
-        if isinstance(cur, dict):
-            for k, v in cur.items():
-                if not _json_strings_preserved(orig, k):
-                    return False
-                stack.append(v)
-        elif isinstance(cur, list):
-            stack.extend(cur)
-        elif isinstance(cur, str):
-            if cur and cur not in orig:
-                return False
-    return True
-
-
-def _strip_line_comments(s):
-    """Remove `// ...` to end-of-line, but never inside a double-quoted JSON
-    string (so 'https://x' or 'rg -n //foo src/' keep their content)."""
-    out = []
-    i, n = 0, len(s)
-    in_str = esc = False
-    while i < n:
-        ch = s[i]
-        if in_str:
-            out.append(ch)
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            i += 1
-            continue
-        if ch == '"':
-            in_str = True
-            out.append(ch)
-            i += 1
-        elif ch == "/" and i + 1 < n and s[i + 1] == "/":
-            # skip to end of line, but keep the newline itself
-            while i < n and s[i] != "\n":
-                i += 1
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
-
-
-def _close_unclosed(s):
-    """Append enough closing braces to balance an object/array that the model
-    forgot to close (e.g. {'a': {'b': 1}  ->  {'a': {'b': 1}})."""
-    out = []
-    depth = 0
-    in_str = esc = False
-    for ch in s:
-        if in_str:
-            out.append(ch)
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-            out.append(ch)
-        elif ch in "{[":
-            depth += 1
-            out.append(ch)
-        elif ch in "}]":
-            if depth > 0:
-                depth -= 1
-            out.append(ch)
-        else:
-            out.append(ch)
-    return "".join(out) + ("}" * depth)
+def normalize_tool_tags(text):
+    """Safety net: map native GLM tool-call tags to ours. GLM sometimes emits
+    <tool_call>/<arg_key>/<arg_value> (and <command> for bash) instead of the
+    <tc>/<ak>/<av> we asked for. Everything is converted BEFORE parsing."""
+    if "<tool_call>" in text or "<arg_key>" in text or "<arg_value>" in text or "<command>" in text:
+        text = text.replace("<tool_call>", "<tc>")\
+                   .replace("</tool_call>", "</tc>")\
+                   .replace("<tool_calls>", "<tc>")\
+                   .replace("</tool_calls>", "</tc>")\
+                   .replace("<arg_key>", "<ak>")\
+                   .replace("</arg_key>", "</ak>")\
+                   .replace("<arg_value>", "<av>")\
+                   .replace("</arg_value>", "</av>")\
+                   .replace("<akcmd>", "<ak>")\
+                   .replace("<command>", "<ak>command</ak><av>")\
+                   .replace("</command>", "</av>")
+    return text
 
 
 def parse_tool_call_blocks(text):
-    """Parse tool calls from ALL <tc>...</tc> blocks, recognising BOTH the
-    primary <tc> wrapper and the legacy <tool_call>/<tool_call> pairs.
-    Each block may hold ONE or SEVERAL consecutive JSON objects. Parallel
-    calls can therefore be written either as several objects inside ONE block
-    OR as several separate blocks - both are collected.This way a broken object
-    in one block doesn't take down the other calls (streaming-friendly)."""
+    """Parse tool calls from ALL <tc>...</tc> blocks. The only form is native
+    GLM XML: NAME<ak>K</ak><av>V</av>... (keys/vals repeat). Bare-name form
+    <tc>name</tc> is a tool with no arguments. Parallel calls = several blocks.
+    Native GLM tags (<tool_call>/<arg_key>/<arg_value>/<command>) are
+    auto-converted to ours before parsing."""
+    text = normalize_tool_tags(text)
     calls = []
-    blocks = list(re.finditer(r"<(?:tc|tool_call)>\s*([\s\S]*?)\s*</(?:tc|tool_call)>", text))
+    blocks = list(re.finditer(r"<tc>\s*([\s\S]*?)\s*</tc>", text))
     for m in blocks:
         inner = m.group(1).strip()
-        inner = re.sub(r"^```(?:json)?\s*", "", inner)
-        inner = re.sub(r"\s*```$", "", inner).strip()
-        candidates = []
-        try:
-            obj = json.loads(inner)
-            candidates = [obj]
-        except json.JSONDecodeError:
-            # Multiple balanced top-level objects inside THIS block = parallel
-            # calls -> handle each separately (a whole-block repair would only
-            # recover the first one).
-            objs = _extract_json_objects(inner)
-            used_objs = False
-            if len(objs) > 1:
-                for raw in objs:
-                    fixed = _repair_json(raw)
-                    if fixed is not None and isinstance(fixed, dict):
-                        candidates.append(fixed)
-                        used_objs = True
-                    else:
-                        try:
-                            candidates.append(json.loads(raw))
-                            used_objs = True
-                        except json.JSONDecodeError:
-                            log(f"[tools] invalid JSON fragment skipped: {raw[:120]}", level="WARN")
-            if not used_objs:
-                # Single (possibly broken) object/array -> auto-repair the block.
-                repaired = _repair_json(inner)
-                if repaired is not None:
-                    if isinstance(repaired, list):
-                        candidates = repaired
-                    else:
-                        candidates = [repaired]
-        for obj in candidates:
-            if isinstance(obj, dict) and obj.get("name"):
-                calls.append({
-                    "name": str(obj["name"]),
-                    "arguments": json.dumps(obj.get("arguments") or {}, ensure_ascii=False),
-                })
+        if "<ak>" in inner:
+            call = _parse_glm_xml_call(inner)
+            if call:
+                calls.append(call)
+            continue
+        if re.fullmatch(r"[A-Za-z0-9_.\-]+", inner):
+            calls.append({"name": inner, "arguments": "{}"})
+        else:
+            log(f"[tools] invalid <tc> block skipped: {inner[:120]}", level="WARN")
     return calls
 
 
-# Backward-compatible alias
-parse_ml_tool_calls = parse_tool_call_blocks
-
-
 class ToolStreamBuffer:
-    """Streams visible text, captures <tc>{json}</tc> blocks (and the legacy
-    <tool_call>{json}</tool_call> form) and converts them to OpenAI tool_calls.
+    """Streams visible text, captures <tc>...</tc> blocks (native GLM
+    <tool_call>...</tool_call> too) and converts them to OpenAI tool_calls.
     If a captured block turns out not to be a valid tool call
     (e.g. '<tc>' mentioned in prose/code), its text is released back
     to the output so nothing is lost."""
@@ -1064,42 +758,29 @@ class ZaiSession:
         """Wipe all browser state (cookies/localStorage) and reload the SAME
         account from scratch to clear a captcha/fingerprint. Does NOT touch
         account_idx or requests_on_account, so it never counts as a rotation.
-        Retries internally so a slow page (or a re-appearing captcha) does not
-        fail the request on the first attempt.
         """
         acc = self.accounts[self.account_idx]
-        last_err = None
-        for attempt in range(1, CAPTCHA_RELOAD_ATTEMPTS + 1):
-            try:
-                try:
-                    await self.page.evaluate("try{localStorage.clear();sessionStorage.clear();}catch(e){}")
-                except Exception:
-                    pass
-                await self.context.clear_cookies()
-                await self.context.add_cookies([
-                    {'name': 'token', 'value': acc["token"], 'domain': '.z.ai', 'path': '/'},
-                ])
-                # Force a real reload: page.reload() re-navigates the current
-                # document from scratch (goto() to the same SPA URL can be
-                # served from the bfcache and miss the storage wipe, so the
-                # captcha survives).
-                try:
-                    await self.page.reload(wait_until='domcontentloaded', timeout=60000)
-                except Exception:
-                    await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
-                # double-check we are actually on the chat origin
-                if self.page.url and "chat.z.ai" not in self.page.url:
-                    await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
-                ready = await poll_js(self.page, MODEL_READY_JS, timeout_s=CAPTCHA_RELOAD_READY_TIMEOUT, poll_ms=250)
-                if ready:
-                    return True
-                last_err = RuntimeError(f"Account #{self.account_idx}: page never became ready after captcha reload")
-            except Exception as e:
-                last_err = e
-            if attempt < CAPTCHA_RELOAD_ATTEMPTS:
-                log(f"[captcha] reload attempt {attempt}/{CAPTCHA_RELOAD_ATTEMPTS} not ready, retrying", level="WARN")
-                await asyncio.sleep(CAPTCHA_RELOAD_BACKOFF)
-        raise last_err or RuntimeError(f"Account #{self.account_idx}: page never became ready after captcha reload")
+        try:
+            await self.page.evaluate("try{localStorage.clear();sessionStorage.clear();}catch(e){}")
+        except Exception:
+            pass
+        await self.context.clear_cookies()
+        await self.context.add_cookies([
+            {'name': 'token', 'value': acc["token"], 'domain': '.z.ai', 'path': '/'},
+        ])
+        # Force a real reload: page.reload() re-navigates the current document
+        # from scratch (goto() to the same SPA URL can be served from the bfcache
+        # and miss the storage wipe, so the captcha survives).
+        try:
+            await self.page.reload(wait_until='domcontentloaded', timeout=60000)
+        except Exception:
+            await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
+        # double-check we are actually on the chat origin
+        if self.page.url and "chat.z.ai" not in self.page.url:
+            await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
+        ready = await poll_js(self.page, MODEL_READY_JS, timeout_s=30)
+        if not ready:
+            raise RuntimeError(f"Account #{self.account_idx}: page never became ready after captcha reload")
 
     async def _monitor_captcha(self, captcha_event, stop_event):
         """Background task: poll for the Aliyun captcha while we consume the
@@ -1266,9 +947,10 @@ class ZaiSession:
         return models
 
     def build_prompt(self, messages, tools=None):
-        """History is rendered as OpenAI-style JSONL with FLAT tool calls
-        ({"name": ..., "arguments": {...}} — same shape the model must emit
-        inside <tc>), results keyed by tool name, no ids anywhere."""
+        """History is rendered as OpenAI-style JSONL with native GLM XML tool
+        calls (<tc>NAME<ak>...</ak><av>...</av></tc>
+        — same shape the model must emit), results keyed by tool name and
+        wrapped in <tool_response>...</tool_response>, no ids anywhere."""
         last_user = ""
         call_label_by_id = {}
 
@@ -1322,17 +1004,19 @@ class ZaiSession:
                     fn = tc.get("function") or {}
                     raw_args = fn.get("arguments", {})
                     if isinstance(raw_args, str):
-                        repaired = _repair_json(raw_args)
-                        args = repaired if isinstance(repaired, dict) else {"_raw": str(raw_args)}
+                        try:
+                            args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            args = {"_raw": str(raw_args)}
                     else:
                         args = raw_args or {}
                     calls.append({"name": fn.get("name", "unknown"), "arguments": args})
-                # Tool calls are folded into the SAME content field as <tc>
-                # blocks at the end (the shape the model itself must emit),
-                # instead of a separate tool_calls key.
+                # Tool calls are folded into the SAME content field as native
+                # GLM <tc> XML blocks at the end (the shape the model
+                # itself must emit), instead of a separate tool_calls key.
                 if calls:
                     tc_text = "\n".join(
-                        f"<tc>{json.dumps(c, ensure_ascii=False)}</tc>" for c in calls
+                        tool_call_xml(c["name"], c.get("arguments") or {}) for c in calls
                     )
                     if content:
                         content += "\n"
@@ -1343,7 +1027,8 @@ class ZaiSession:
                 hist_lines.append(line)
             elif role == "tool":
                 label = call_label_by_id.get(m.get("tool_call_id"), "unknown")
-                hist_lines.append({"role": "tool", "name": label, "content": str(content)})
+                hist_lines.append({"role": "tool", "name": label,
+                                   "content": f"<tool_response>{content}</tool_response>"})
 
         # The first system message (if any) becomes the "[System instructions]"
         # block and is placed right after the History header below.
@@ -1370,7 +1055,13 @@ class ZaiSession:
             parts.append(json.dumps({"role": "system", "content": system_instr}, ensure_ascii=False))
         # 4. FINAL_SYSTEM_MESSAGE as a separate line (only if tools)
         if tools:
-            parts.append(json.dumps({"role": "system", "content": FINAL_SYSTEM_MESSAGE}, ensure_ascii=False))
+            final_line = json.dumps({"role": "system", "content": FINAL_SYSTEM_MESSAGE}, ensure_ascii=False)
+            # The convo text is pasted verbatim into the site's input, so the
+            # model reads the JSONL escapes literally (\\n shows as two
+            # backslashes). Collapse one layer so \\n / \\" in the source
+            # reach the model as the intended single backslash.
+            final_line = final_line.replace("\\\\", "\\").replace("\\\\\"", "\\\"")
+            parts.append(final_line)
         # 5. Each history line as JSONL
         parts.extend(json.dumps(h, ensure_ascii=False) for h in hist_lines)
 
@@ -1935,8 +1626,12 @@ async def chat_completions(request: Request):
                         # captcha retries forever (as before) - just reload the same
                         # account until the invisible check passes
                         log(f"[request] {fail_reason} -> retry", level="WARN")
-                        await wk.reload_current()
-                        continue
+                        try:
+                            await wk.reload_current()
+                        except Exception as e:
+                            fail_reason = str(e)
+                        else:
+                            continue
                     retries += 1
                     if retries >= MAX_REQUEST_RETRIES:
                         log(f"[request] giving up after {retries} retries: {fail_reason}", level="ERROR")
@@ -1944,7 +1639,10 @@ async def chat_completions(request: Request):
                         yield "data: [DONE]\n\n"
                         return
                     log(f"[request] {fail_reason} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
-                    await wk.reload_current()
+                    try:
+                        await wk.reload_current()
+                    except Exception as e:
+                        fail_reason = str(e)
                     continue
 
                 # clean completion
@@ -2073,14 +1771,21 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
                     # captcha retries forever (as before) - just reload the same
                     # account until the invisible check passes
                     log(f"[request] {fail_reason} -> retry", level="WARN")
-                    await wk.reload_current()
-                    continue
+                    try:
+                        await wk.reload_current()
+                    except Exception as e:
+                        fail_reason = str(e)
+                    else:
+                        continue
                 retries += 1
                 if retries >= MAX_REQUEST_RETRIES:
                     log(f"[request] giving up after {retries} retries: {fail_reason}", level="ERROR")
                     return JSONResponse({"error": {"message": fail_reason}}, status_code=502)
                 log(f"[request] {fail_reason} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
-                await wk.reload_current()
+                try:
+                    await wk.reload_current()
+                except Exception as e:
+                    fail_reason = str(e)
                 continue
 
             break

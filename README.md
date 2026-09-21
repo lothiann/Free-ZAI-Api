@@ -23,7 +23,7 @@ client (opencode)                proxy (main.py)                  chat.z.ai
       │  OpenAI chunks                 │  (reasoning_content + content)│
 ```
 
-- **Tool calling** — z.ai has no native function-calling over web chat, so the proxy injects tool schemas into the prompt and streams back the model's `<tc>{json}</tc>` responses as standard OpenAI `delta.tool_calls` (z.ai strips native `<tool_call>` tags from the stream, hence the custom tag).
+- **Tool calling** — z.ai has no native function-calling over web chat, so the proxy injects tool schemas into the prompt and streams back the model's `<tc>NAME<ak>key</ak><av>value</av></tc>` responses as standard OpenAI `delta.tool_calls` (z.ai strips native `<tool_call>/<arg_key>/<arg_value>` tags from the stream, hence the custom `tc`/`ak`/`av` tags).
 - **Account rotation** — round-robin between accounts from `accounts.json`.
 - **Cooldown** — configurable delay between requests to avoid triggering captchas.
 - **Popups** — promotional dialogs are closed automatically by a background watcher.
