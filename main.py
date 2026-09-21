@@ -24,7 +24,7 @@ FALLBACK_MODEL = "glm-5.2"
 # ===== STARTUP MENU STATE (toggled from the console before launch) =====
 CAPTCHA_BYPASS = True    # [2] reload same account & retry when Aliyun captcha appears
 ACCOUNT_ROTATE = True    # [3] rotate between accounts after rotate_every requests
-HEADLESS = False         # [6] run the Playwright browser in headless mode
+HEADLESS = True           # [6] hide the browser window (True = hidden, default on)
 REQUEST_COOLDOWN = 5.0  # seconds between requests, avoids captcha on rapid fire
 TOOL_CALL_DELAY = 0.5  # seconds between parallel tool-call chunks, avoids Busy errors in the client
 CAPTCHA_RELOAD_ATTEMPTS = 3      # reload attempts inside reload_current() before failing
@@ -71,7 +71,10 @@ def log(msg, level="INFO"):
         color = ANSI.get(level, "") + ANSI.get("BOLD", "")
         ts_col = f"{ANSI['DIM']}{ts}{ANSI['RESET']}"
         lvl_col = f"{color}[{level}]{ANSI['RESET']}"
-        print(f"{ts_col} {lvl_col} {msg}", flush=True)
+        if level == "OK":
+            print(f"{ts_col} {lvl_col} {ANSI['OK']}{msg}{ANSI['RESET']}", flush=True)
+        else:
+            print(f"{ts_col} {lvl_col} {msg}", flush=True)
     except UnicodeEncodeError:
         print(line.encode("ascii", errors="replace").decode(), flush=True)
     with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -479,6 +482,44 @@ def _extract_json_objects(s):
     return objs
 
 
+def _strip_stray_quotes(s):
+    """Remove quote characters that cannot legally START a JSON string at
+    their position. A quote is legal only right after a key/value context
+    opener (`{`, `[`, `:`, `,`) or at the very start; anywhere else it is a
+    stray that the model produced by accident (e.g. `"a": 123"}}` - a quote
+    after the value has nothing to open). Only quotes OUTSIDE real strings
+    are touched, so content inside strings (apostrophes, urls, escaped
+    quotes) is always preserved."""
+    out = []
+    i, n = 0, len(s)
+    in_str = esc = False
+    while i < n:
+        ch = s[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            j = len(out) - 1
+            while j >= 0 and out[j] in " \t\r\n":
+                j -= 1
+            valid = j < 0 or out[j] in "{[:," 
+            if valid:
+                in_str = True
+                out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _repair_json(text):
     """Automatically salvage a broken JSON object/array using the failure
     patterns enumerated in <BAD_EXAMPLES>:
@@ -517,11 +558,15 @@ def _repair_json(text):
     t_tc = re.sub(r",\s*([}\]])", r"\1", text)
     t_tc = re.sub(r",\s*$", "", t_tc)
     variants.append(t_tc)
-    # 4) Close an unclosed trailing brace by appending the right number of }.
+    # 4) Remove stray quote characters outside strings (e.g. `123"}}`).
+    t_sq = _strip_stray_quotes(text)
+    variants.append(t_sq)
+    # 5) Close an unclosed trailing brace by appending the right number of }.
     variants.append(_close_unclosed(text))
-    # 5) Combined: several fixes applied together (e.g. trailing comma AND an
+    # 6) Combined: several fixes applied together (e.g. trailing comma AND an
     #    unclosed brace in the same block).
     variants.append(_close_unclosed(t_tc))
+    variants.append(_close_unclosed(t_sq))
 
     for v in variants:
         if not v or not v.strip():
@@ -542,7 +587,52 @@ def _repair_json(text):
             continue
         if isinstance(obj, (dict, list)):
             return obj
+    # 7) Optional json_repair library (lazy import - never a hard dependency).
+    #    Accept only if it did NOT invent new string content: every string we
+    #    keep must already appear in the input, so fabrication like guessing
+    #    "...a.ex" -> "...a.example." is rejected instead of corrupting a call.
+    for v in _repair_via_lib(text):
+        return v
     return None
+
+
+def _repair_via_lib(s):
+    """Try the `json_repair` package (pip install json-repair) as a final fallback.
+    Guards against content fabrication by only returning parsed values whose
+    string leaves are all present in the original input."""
+    try:
+        from json_repair import repair_json
+    except Exception:
+        return []
+    try:
+        value = repair_json(s, return_objects=True)
+    except Exception:
+        return []
+    # avoid parsing a bare string/comment/number — we need an object or array
+    if not isinstance(value, (dict, list)):
+        return []
+    if _json_strings_preserved(s, value):
+        return [value]
+    return []
+
+
+def _json_strings_preserved(orig, obj):
+    """True if every string leaf in `obj` also appears in `orig`. Detects when
+    a repair library fabricated content that the model never emitted."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                if not _json_strings_preserved(orig, k):
+                    return False
+                stack.append(v)
+        elif isinstance(cur, list):
+            stack.extend(cur)
+        elif isinstance(cur, str):
+            if cur and cur not in orig:
+                return False
+    return True
 
 
 def _strip_line_comments(s):
@@ -857,9 +947,10 @@ def load_accounts():
 # ===== BROWSER SESSION =====
 
 # ===== WINDOW HIDING (Windows only) =====
-# The browser is a REAL GUI Chromium (headless breaks Aliyun captcha), but its
-# window must not be visible. We hide it via Win32: SW_HIDE removes it from the
-# screen, WS_EX_TOOLWINDOW removes its button from the taskbar / Alt+Tab list.
+# The browser is a REAL GUI Chromium (true headless breaks Aliyun captcha), but
+# when HEADLESS is on its window must not be visible. We hide it via Win32:
+# SW_HIDE removes it from the screen, WS_EX_TOOLWINDOW removes its button from
+# the taskbar / Alt+Tab list. HEADLESS = hide the window or not.
 import psutil  # noqa: E402
 
 
@@ -924,8 +1015,6 @@ class ZaiSession:
         self._models_cache = None
         self._models_cache_ts = 0
         self.last_activity = 0.0
-        self.last_prompt_chars = 0
-        self._last_fetch_error_ts = 0.0
         self.hide_pids = set()
         # account rotation
         if accounts is None:
@@ -1059,50 +1148,56 @@ class ZaiSession:
     async def start(self):
         p = await async_playwright().start()
         _before_pids = _ms_playwright_chrome_pids()
+        args = [
+            '--no-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            # strip non-essential components (safe on Windows:
+            # NO --single-process / --no-zygote, they crash the browser)
+            '--disable-gpu',
+            '--disable-software-rasterizer',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-component-update',
+            '--disable-default-apps',
+            '--disable-sync',
+            '--disable-translate',
+            '--disable-breakpad',
+            '--disable-crash-reporter',
+            '--disable-dev-shm-usage',
+            '--disable-renderer-backgrounding',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-background-timer-throttling',
+            '--disable-renderer-throttling',
+            '--metrics-recording-only',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--mute-audio',
+            '--window-size=1366,768',
+        ]
+        # HEADLESS = hide the window. The browser itself stays a REAL (non-
+        # headless) GUI build because true headless mode triggers Aliyun
+        # captcha; with hiding on we just park the window far off-screen.
+        if HEADLESS:
+            args.append('--window-position=-32000,-32000')
         self.browser = await p.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                '--no-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                # strip non-essential components (safe on Windows:
-                # NO --single-process / --no-zygote, they crash the browser)
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-component-update',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--disable-breakpad',
-                '--disable-crash-reporter',
-                '--disable-dev-shm-usage',
-                '--disable-renderer-backgrounding',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-background-timer-throttling',
-                '--disable-renderer-throttling',
-                '--metrics-recording-only',
-                '--no-first-run',
-                '--no-default-browser-check',
-                '--mute-audio',
-                # hidden window while staying a REAL (non-headless) browser:
-                # headless triggers Aliyun captcha, so run the GUI build but
-                # park the window far off-screen so nothing is visible.
-                '--window-position=-32000,-32000',
-                '--window-size=1366,768',
-            ],
+            headless=False,
+            args=args,
         )
-        # Hide this browser's window IMMEDIATELY (the window appears at launch,
-        # so hiding it here beats any periodic hider loop).
-        self.hide_pids = _ms_playwright_chrome_pids() - _before_pids
-        _hide_windows_for_pids(self.hide_pids)
-        # Chromium creates its top-level window a few ms AFTER launch() returns,
-        # so keep re-hiding during the first ~2s while that window materialises.
-        async def _early_hide():
-            for _ in range(50):
-                _hide_windows_for_pids(self.hide_pids)
-                await asyncio.sleep(0.04)
-        asyncio.create_task(_early_hide())
+        if HEADLESS:
+            # Hide this browser's window IMMEDIATELY (the window appears at
+            # launch, so hiding it here beats any periodic hider loop).
+            self.hide_pids = _ms_playwright_chrome_pids() - _before_pids
+            _hide_windows_for_pids(self.hide_pids)
+            # Chromium creates its top-level window a few ms AFTER launch()
+            # returns, so keep re-hiding during the first ~2s while that
+            # window materialises.
+            async def _early_hide():
+                for _ in range(50):
+                    _hide_windows_for_pids(self.hide_pids)
+                    await asyncio.sleep(0.04)
+            asyncio.create_task(_early_hide())
+        else:
+            self.hide_pids = set()
         self.context = await self.browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
             viewport={'width': 1536, 'height': 735},
@@ -1130,8 +1225,6 @@ class ZaiSession:
 
         async def on_pageerror(err):
             log(f"[PAGE ERROR] {err}", level="ERROR")
-            if "Failed to fetch" in str(err):
-                self._last_fetch_error_ts = time.time()
 
         self.page.on('pageerror', on_pageerror)
 
@@ -1341,10 +1434,18 @@ class ZaiSession:
 
     async def prepare_chat(self, model_id):
         """Fresh chat page with the given model selected."""
-        await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
-        ready = await poll_js(self.page, MODEL_READY_JS, timeout_s=30)
-        if not ready:
-            raise RuntimeError("Model selector never appeared")
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
+            ready = await poll_js(self.page, MODEL_READY_JS, timeout_s=30)
+            if not ready:
+                if attempt < attempts:
+                    log(f"[prepare] model selector not ready (attempt {attempt}/{attempts}), "
+                        f"reloading page ...", level="WARN")
+                    await asyncio.sleep(5)
+                    continue
+                raise RuntimeError("Model selector never appeared")
+            break
         # make sure no popup blocks us
         await poll_js(self.page,
                       "() => !document.querySelector('[data-dialog-overlay], div._modal-overlay')",
@@ -1458,8 +1559,7 @@ class ZaiSession:
                 self.last_activity = time.time()
                 return
             if "error" in item:
-                log(f"[stream error] {item['error']}", level="ERROR")
-                yield ("error", json.dumps(item["error"]))
+                yield ("error", item["error"])
                 return
             delta = item.get("delta") or ""
             if delta:
@@ -1516,8 +1616,8 @@ class WorkerPool:
         self._idle.append(wk)
 
     def start_hider(self):
-        """Background loop: keep all worker browser windows hidden."""
-        if os.name != "nt" or self._hider_task is not None:
+        """Background loop: keep all worker browser windows hidden (HEADLESS only)."""
+        if not HEADLESS or os.name != "nt" or self._hider_task is not None:
             return
         async def _hider():
             while True:
@@ -1612,18 +1712,75 @@ def make_chunk(chunk_id, created, model, delta, finish_reason=None):
     }
 
 
-def build_usage(session, full_reasoning, full_answer):
+def _msg_chars(m):
+    try:
+        return len(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        return len(str(m))
+
+
+def _non_text_part_chars(m):
+    """Chars contributed by image / audio content parts inside a message."""
+    image_chars = audio_chars = 0
+    content = m.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            t = part.get("type")
+            if t == "image_url":
+                image_chars += _msg_chars(part.get("image_url") or {})
+            elif t == "input_audio":
+                audio_chars += _msg_chars(part.get("input_audio") or {})
+    return image_chars, audio_chars
+
+
+def build_usage(messages, full_reasoning, full_answer):
     """Char counts (1 token := 1 character), matching the site's
-    ~2M real limit which is made of characters."""
-    prompt_len = getattr(session, "last_prompt_chars", 0)
-    answer_len = sum(len(x) for x in full_answer)
+    ~2M real limit which is made of characters. Output follows the standard
+    OpenAI usage shape (prompt_tokens_details / completion_tokens_details):
+    - prompt_tokens   = every non-assistant message (user/system/developer/
+        tool/function ...) serialized as JSON, incl. image/audio chars;
+    - completion_tokens = every assistant message serialized as JSON (incl.
+        tool_calls) + the newly generated reasoning/answer.
+    """
+    prompt_text = prompt_image = prompt_audio = completion_hist = 0
+    for m in messages or []:
+        n = _msg_chars(m)
+        if (m.get("role") or "unknown") == "assistant":
+            completion_hist += n
+        else:
+            prompt_text += n
+        img, aud = _non_text_part_chars(m)
+        prompt_image += img
+        prompt_audio += aud
+    prompt_image = min(prompt_image, prompt_text)
+    prompt_audio = min(prompt_audio, prompt_text - prompt_image)
+
     reasoning_est = sum(len(x) for x in full_reasoning)
-    details = {"reasoning_tokens": reasoning_est} if reasoning_est else {}
+    answer_est = sum(len(x) for x in full_answer)
+    completion_len = completion_hist + reasoning_est + answer_est
+
     return {
-        "prompt_tokens": prompt_len,
-        "completion_tokens": answer_len,
-        "total_tokens": prompt_len + answer_len,
-        "completion_tokens_details": details,
+        "prompt_tokens": prompt_text,
+        "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "audio_tokens": prompt_audio,
+            "image_tokens": prompt_image,
+            "cached_tokens_details": {
+                "text_tokens": prompt_text - prompt_image - prompt_audio,
+                "audio_tokens": 0,
+                "image_tokens": 0,
+            },
+        },
+        "completion_tokens": completion_len,
+        "completion_tokens_details": {
+            "reasoning_tokens": reasoning_est,
+            "accepted_prediction_tokens": 0,
+            "rejected_prediction_tokens": 0,
+            "audio_tokens": 0,
+        },
+        "total_tokens": prompt_text + completion_len,
     }
 
 
@@ -1655,7 +1812,6 @@ async def chat_completions(request: Request):
     req_model = req_model_canonical
 
     prompt, _last_user = session.build_prompt(messages, tools=body.get("tools"))
-    session.last_prompt_chars = len(prompt)
     thinking_level = session.map_thinking(body.get("reasoning_effort"))
     has_tools = bool(body.get("tools"))
     prompt_len = len(prompt)
@@ -1673,59 +1829,50 @@ async def chat_completions(request: Request):
                 await wk.rate_limit()
                 acc = await wk.before_request()
                 log(f"[account] serving via '{acc.get('name') or acc.get('email')}' ({wk.requests_on_account}/{wk.rotate_every})")
+            except Exception as e:
+                log(f"prepare/send failed: {e}", level="ERROR")
+                yield sse({"error": {"message": str(e), "type": "proxy_error"}})
+                yield "data: [DONE]\n\n"
+                return
 
-                # Retry loop: if the Aliyun captcha pops up (usually right after
-                # we START streaming, sometimes after a navigation), reload the
-                # SAME account to clear fingerprint/cookies and retry WITHOUT
-                # counting a rotation. A retry is only done when the captcha
-                # appears BEFORE any thinking/answer output was delivered to the
-                # client (otherwise a silent retry would duplicate sent tokens).
-                retries = 0
-                while True:
-                    # state is per-attempt (reset on every retry)
-                    wk._last_fetch_error_ts = 0.0
-                    full_reasoning = []
-                    full_answer = []
-                    tool_buf = ToolStreamBuffer() if has_tools else None
-                    finish_reason = "stop"
-                    tool_call_index = 0
-                    stream_error = None
-                    captcha_abort = False
+            # Universal retry: ANY failure (Alipay captcha, page fetch error,
+            # stream error, timeout, exception) while NOTHING has been sent to
+            # the client yet -> reload the same account and retry. Once output
+            # started a retry would duplicate tokens, so we stop retrying then.
+            retries = 0
+            while True:
+                full_reasoning = []
+                full_answer = []
+                tool_buf = ToolStreamBuffer() if has_tools else None
+                finish_reason = "stop"
+                tool_call_index = 0
+                answer_started = False
+                fail_reason = None
 
-                    try:
-                        await wk.prepare_chat(req_model)
-                        await wk.set_thinking(thinking_level)
-                        await wk.send_message(prompt)
-                    except Exception as e:
-                        # Retry ONLY when the actual Aliyun captcha window is
-                        # present; error strings alone are never a captcha.
-                        if await wk.is_captcha() and CAPTCHA_BYPASS:
-                            log("[captcha] Aliyun captcha detected during prepare -> retry", level="WARN")
-                            await wk.reload_current()
-                            retries += 1
-                            if retries >= MAX_REQUEST_RETRIES:
-                                log(f"[captcha] giving up after {retries} retries", level="ERROR")
-                                yield sse({"error": {"message": f"captcha not cleared after {retries} retries", "type": "proxy_error"}})
-                                yield "data: [DONE]\n\n"
-                                return
-                            continue
-                        yield sse({"error": {"message": str(e), "type": "proxy_error"}})
-                        yield "data: [DONE]\n\n"
-                        return
+                try:
+                    await wk.prepare_chat(req_model)
+                    await wk.set_thinking(thinking_level)
+                    await wk.send_message(prompt)
+                except Exception as e:
+                    # a captcha/block during prepare also reloads forever
+                    if await wk.is_captcha() and CAPTCHA_BYPASS:
+                        fail_reason = "captcha appeared"
+                    else:
+                        fail_reason = str(e)
 
-                    # ---- consume the stream, aborting on captcha before output ----
-                    answer_started = False
-                    stop_event = asyncio.Event()
-                    captcha_event = asyncio.Event()
-                    monitor = asyncio.create_task(wk._monitor_captcha(captcha_event, stop_event))
-                    try:
+                captcha_event = asyncio.Event()
+                stop_event = asyncio.Event()
+                monitor = None
+                try:
+                    if fail_reason is None:
+                        monitor = asyncio.create_task(wk._monitor_captcha(captcha_event, stop_event))
                         async for phase, delta in wk.stream_tokens():
                             # captcha appeared before we emitted anything -> retry
                             if captcha_event.is_set() and not answer_started:
-                                captcha_abort = True
+                                fail_reason = "captcha appeared"
                                 break
                             if phase == "error":
-                                stream_error = delta
+                                fail_reason = delta
                                 break
                             if phase == "thinking":
                                 answer_started = True
@@ -1764,57 +1911,44 @@ async def chat_completions(request: Request):
                                     tool_call_index += 1
                                     last_sent = time.time()
                                 answer_started = True
-                    finally:
-                        stop_event.set()
+                finally:
+                    stop_event.set()
+                    if monitor:
                         monitor.cancel()
 
-                    # Decisive captcha check AFTER stream_tokens returns, regardless
-                    # of whether the async-for body ever ran (a captcha 'done'
-                    # sentinel makes stream_tokens return before the first token,
-                    # so the in-loop check above may never execute).
-                    if captcha_event.is_set() and not answer_started:
-                        captcha_abort = True
+                if fail_reason is None and captcha_event.is_set() and not answer_started:
+                    fail_reason = "captcha appeared"
 
-                    if stream_error:
-                        yield sse({"error": {"message": stream_error, "type": "proxy_error"}})
+                if fail_reason:
+                    if "upstream 413" in fail_reason or "Request Entity Too Large" in fail_reason:
+                        # payload over the site limit -> never retry (same result)
+                        log(f"[request] {fail_reason}", level="ERROR")
+                        yield sse({"error": {"message": fail_reason, "type": "proxy_error"}})
                         yield "data: [DONE]\n\n"
                         return
-
-                    if captcha_abort:
-                        log("[captcha] Aliyun captcha detected during stream -> retry", level="WARN")
+                    if answer_started:
+                        # output already delivered -> a retry would duplicate tokens
+                        yield sse({"error": {"message": fail_reason, "type": "proxy_error"}})
+                        yield "data: [DONE]\n\n"
+                        return
+                    if fail_reason == "captcha appeared":
+                        # captcha retries forever (as before) - just reload the same
+                        # account until the invisible check passes
+                        log(f"[request] {fail_reason} -> retry", level="WARN")
                         await wk.reload_current()
-                        retries += 1
-                        if retries >= MAX_REQUEST_RETRIES:
-                            log(f"[captcha] giving up after {retries} retries", level="ERROR")
-                            yield sse({"error": {"message": f"captcha not cleared after {retries} retries", "type": "proxy_error"}})
-                            yield "data: [DONE]\n\n"
-                            return
                         continue
+                    retries += 1
+                    if retries >= MAX_REQUEST_RETRIES:
+                        log(f"[request] giving up after {retries} retries: {fail_reason}", level="ERROR")
+                        yield sse({"error": {"message": fail_reason, "type": "proxy_error"}})
+                        yield "data: [DONE]\n\n"
+                        return
+                    log(f"[request] {fail_reason} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
+                    await wk.reload_current()
+                    continue
 
-                    # Network hiccup: the page's fetch blew up (server closed the
-                    # connection / transient failure) BEFORE any content was sent.
-                    # Retry the same account with a fresh page instead of failing.
-                    if (not answer_started
-                            and wk._last_fetch_error_ts
-                            and time.time() - wk._last_fetch_error_ts < 5):
-                        log("[fetch] Failed to fetch during stream -> retry", level="WARN")
-                        wk._last_fetch_error_ts = 0.0
-                        await wk.reload_current()
-                        retries += 1
-                        if retries >= MAX_REQUEST_RETRIES:
-                            log(f"[fetch] giving up after {retries} retries", level="ERROR")
-                            yield sse({"error": {"message": f"fetch failed after {retries} retries", "type": "proxy_error"}})
-                            yield "data: [DONE]\n\n"
-                            return
-                        continue
-
-                    # no captcha, no fetch error, no stream error -> clean completion
-                    break
-            except Exception as e:
-                log(f"prepare/send failed: {e}", level="ERROR")
-                yield sse({"error": {"message": str(e), "type": "proxy_error"}})
-                yield "data: [DONE]\n\n"
-                return
+                # clean completion
+                break
 
             try:
                 if tool_buf is not None:
@@ -1824,7 +1958,7 @@ async def chat_completions(request: Request):
                         yield sse(make_chunk(chunk_id, created, req_model, {"content": leftover}))
 
                 yield sse(make_chunk(chunk_id, created, req_model, {}, finish_reason=finish_reason))
-                usage_out = build_usage(wk, full_reasoning, full_answer)
+                usage_out = build_usage(messages, full_reasoning, full_answer)
                 yield sse({
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
@@ -1846,9 +1980,9 @@ async def chat_completions(request: Request):
                 asyncio.create_task(_stop_and_log())
                 raise
             finally:
-                log(f"<-- done: reasoning={sum(len(x) for x in full_reasoning)}ch "
+                log(f"--> done: reasoning={sum(len(x) for x in full_reasoning)}ch "
                     f"answer={sum(len(x) for x in full_answer)}ch "
-                    f"prompt_len={prompt_len} | model={req_model}")
+f"prompt_len={prompt_len} | model={req_model}", level="OK")
                 with open("last_response.json", "w", encoding="utf-8") as f:
                     json.dump({"reasoning": "".join(full_reasoning), "answer": "".join(full_answer)},
                               f, ensure_ascii=False, indent=2)
@@ -1861,98 +1995,92 @@ async def chat_completions(request: Request):
     # non-streaming: accumulate (own worker per request, like the stream path)
     wk = await pool.acquire()
     try:
+        try:
+            await wk.rate_limit()
+            await wk.before_request()
+        except Exception as e:
+            log(f"prepare/send failed: {e}", level="ERROR")
+            return JSONResponse({"error": {"message": str(e)}}, status_code=502)
+
+        # Universal retry: ANY failure while NOTHING has accumulated yet ->
+        # reload the same account and retry. Once output started a retry would
+        # duplicate tokens, so we stop retrying then.
         retries = 0
         while True:
             reasoning_parts, answer_parts = [], []
             raw_answer = ""
             tool_buf = ToolStreamBuffer() if has_tools else None
-            captcha_abort = False
-            stream_failed = None
-            wk._last_fetch_error_ts = 0.0
+            fail_reason = None
+
             try:
-                await wk.rate_limit()
-                await wk.before_request()
                 await wk.prepare_chat(req_model)
                 await wk.set_thinking(thinking_level)
                 await wk.send_message(prompt)
             except Exception as e:
-                # Retry ONLY when the actual Aliyun captcha window is present;
-                # error strings alone are never a captcha.
+                # a captcha/block during prepare also reloads forever
                 if await wk.is_captcha() and CAPTCHA_BYPASS:
-                    log("[captcha] Aliyun captcha detected during prepare -> retry", level="WARN")
-                    await wk.reload_current()
-                    retries += 1
-                    if retries >= MAX_REQUEST_RETRIES:
-                        log(f"[captcha] giving up after {retries} retries", level="ERROR")
-                        return JSONResponse({"error": {"message": f"captcha not cleared after {retries} retries"}},
-                                            status_code=502)
-                    continue
-                log(f"prepare/send failed: {e}", level="ERROR")
-                return JSONResponse({"error": {"message": str(e)}}, status_code=502)
+                    fail_reason = "captcha appeared"
+                else:
+                    fail_reason = str(e)
 
             captcha_event = asyncio.Event()
             stop_event = asyncio.Event()
-            monitor = asyncio.create_task(wk._monitor_captcha(captcha_event, stop_event))
+            monitor = None
             try:
-                async for phase, delta in wk.stream_tokens():
-                    if captcha_event.is_set() and not (reasoning_parts or answer_parts):
-                        captcha_abort = True
-                        break
-                    if phase == "error":
-                        stream_failed = delta
-                        break
-                    if phase == "thinking":
-                        reasoning_parts.append(delta)
-                    elif phase != "error":
-                        if tool_buf is not None:
-                            raw_answer += delta
-                            visible, _ = tool_buf.feed(delta)
-                            answer_parts.append(visible)
-                            leftover = ""
-                        else:
-                            answer_parts.append(delta)
-                            raw_answer += delta
-                if tool_buf is not None:
-                    leftover = tool_buf.flush()
-                    if leftover:
-                        answer_parts.append(leftover)
+                if fail_reason is None:
+                    monitor = asyncio.create_task(wk._monitor_captcha(captcha_event, stop_event))
+                    async for phase, delta in wk.stream_tokens():
+                        if captcha_event.is_set() and not (reasoning_parts or answer_parts):
+                            fail_reason = "captcha appeared"
+                            break
+                        if phase == "error":
+                            fail_reason = delta
+                            break
+                        if phase == "thinking":
+                            reasoning_parts.append(delta)
+                        elif phase != "error":
+                            if tool_buf is not None:
+                                raw_answer += delta
+                                visible, _ = tool_buf.feed(delta)
+                                answer_parts.append(visible)
+                                leftover = ""
+                            else:
+                                answer_parts.append(delta)
+                                raw_answer += delta
+                    if tool_buf is not None:
+                        leftover = tool_buf.flush()
+                        if leftover:
+                            answer_parts.append(leftover)
             finally:
                 stop_event.set()
-                monitor.cancel()
+                if monitor:
+                    monitor.cancel()
 
-            # Decisive captcha check AFTER stream_tokens returns, even if the
-            # async-for body never ran (a captcha 'done' sentinel returns before
-            # the first token, so the in-loop check above may not execute).
-            if captcha_event.is_set() and not (reasoning_parts or answer_parts):
-                captcha_abort = True
+            if fail_reason is None and captcha_event.is_set() and not (reasoning_parts or answer_parts):
+                fail_reason = "captcha appeared"
 
-            if stream_failed:
-                return JSONResponse({"error": {"message": stream_failed, "type": "proxy_error"}},
-                                    status_code=502)
-
-            if captcha_abort:
-                log("[captcha] Aliyun captcha detected -> retry", level="WARN")
-                await wk.reload_current()
+            if fail_reason:
+                if "upstream 413" in fail_reason or "Request Entity Too Large" in fail_reason:
+                    # payload over the site limit -> never retry (same result)
+                    log(f"[request] {fail_reason}", level="ERROR")
+                    return JSONResponse({"error": {"message": fail_reason, "type": "proxy_error"}},
+                                        status_code=502)
+                if reasoning_parts or answer_parts:
+                    # output already produced -> a retry would duplicate tokens
+                    return JSONResponse({"error": {"message": fail_reason, "type": "proxy_error"}},
+                                        status_code=502)
+                if fail_reason == "captcha appeared":
+                    # captcha retries forever (as before) - just reload the same
+                    # account until the invisible check passes
+                    log(f"[request] {fail_reason} -> retry", level="WARN")
+                    await wk.reload_current()
+                    continue
                 retries += 1
                 if retries >= MAX_REQUEST_RETRIES:
-                    log(f"[captcha] giving up after {retries} retries", level="ERROR")
-                    return JSONResponse({"error": {"message": f"captcha not cleared after {retries} retries"}},
-                                        status_code=502)
-                continue
-
-            # Network hiccup: the page's fetch blew up BEFORE any output was
-            # produced (a silent retry would otherwise duplicate tokens).
-            if (not (reasoning_parts or answer_parts)
-                    and wk._last_fetch_error_ts
-                    and time.time() - wk._last_fetch_error_ts < 5):
-                log("[fetch] Failed to fetch during stream -> retry", level="WARN")
-                wk._last_fetch_error_ts = 0.0
+                    log(f"[request] giving up after {retries} retries: {fail_reason}", level="ERROR")
+                    return JSONResponse({"error": {"message": fail_reason}}, status_code=502)
+                log(f"[request] {fail_reason} -> retry {retries}/{MAX_REQUEST_RETRIES}", level="WARN")
                 await wk.reload_current()
-                retries += 1
-                if retries >= MAX_REQUEST_RETRIES:
-                    log(f"[fetch] giving up after {retries} retries", level="ERROR")
-                    return JSONResponse({"error": {"message": f"fetch failed after {retries} retries"}},
-                                        status_code=502)
                 continue
 
             break
@@ -1963,9 +2091,9 @@ async def chat_completions(request: Request):
     message = {"role": "assistant", "content": content,
                "reasoning_content": "".join(reasoning_parts)}
     finish = "stop"
-    log(f"<-- done: reasoning={sum(len(x) for x in reasoning_parts)}ch "
+    log(f"--> done: reasoning={sum(len(x) for x in reasoning_parts)}ch "
         f"answer={sum(len(x) for x in answer_parts)}ch "
-        f"prompt_len={prompt_len} | model={req_model}")
+        f"prompt_len={prompt_len} | model={req_model}", level="OK")
     if has_tools:
         calls = parse_tool_call_blocks(raw_answer)
         if calls:
@@ -1986,12 +2114,12 @@ async def chat_completions(request: Request):
             "message": message,
             "finish_reason": finish,
         }],
-        "usage": build_usage(wk, reasoning_parts, answer_parts),
+        "usage": build_usage(messages, reasoning_parts, answer_parts),
     }
 
 
 async def main():
-    pool.start_hider()   # keep worker browser windows hidden (Windows only)
+    pool.start_hider()   # keep worker windows hidden (Windows only, HEADLESS on)
     await run_menu()
     # No global browser here: the pool spawns one browser per active
     # request on demand (see WorkerPool.acquire).
@@ -2092,7 +2220,7 @@ def _render_menu():
     table = [
         ["[1] Start", f"[4] API Port: {PORT}", "[7] GitHub"],
         [f"[2] {_tick(CAPTCHA_BYPASS)} Captcha Bypass", "[5] Open accounts.json", "[8] Exit"],
-        [f"[3] {_tick(ACCOUNT_ROTATE)} Account Rotate", f"[6] {_tick(HEADLESS)} Headless Browser", ""],
+        [f"[3] {_tick(ACCOUNT_ROTATE)} Account Rotate", f"[6] {_tick(HEADLESS)} Hide Window", ""],
     ]
     # is then separated by exactly COL_GAP spaces, so all rows align perfectly.
     COL_GAP = 3
