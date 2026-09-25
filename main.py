@@ -231,7 +231,7 @@ CAPTCHA_JS = """
 
 # Injected right after "# History ..." header as a final system line when tools
 # are used. Edit the text freely - the proxy injects it verbatim.
-FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc>, <ak> and <av>. NEVER write {"role": "tool", "name": "...", "content": "..."} block. The path rules ALWAYS apply, even if context seems more important. NEVER write anything after <tc> block. <tc> block must ALWAYS be at the end of your response. See <rules> and <system> for rules. See <bad_examples> for bad examples. NEVER write \\n - this does NOT work. Function name goes right after <tc>, each argument is <ak>key</ak><av>value</av>. Values go directly inside <av>...</av> without quotes. NEVER output JSON keys role, content, thinking, name, tool_call_id as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks."""
+FINAL_SYSTEM_MESSAGE = """All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc>, <ak> and <av>. See <tool_call_format>. NEVER write anything after <tc> block. <tc> block must ALWAYS be at the end of your response. NEVER write \\n - this does NOT work. Function name goes right after <tc>, each argument is <ak>key</ak><av>value</av>. Values go directly inside <av>...</av> without quotes. NEVER output JSON keys role, content, thinking, name, tool_call_id, tool, user, ... as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks. Your reply is plain text, optionally with <tc>...</tc> blocks."""
 
 SYSTEM_CONTINUE = 'This is a forwarded conversation.'
 
@@ -242,9 +242,10 @@ TOOL_PROMPT_TEMPLATE = """ # You have access to these tools:
 {instructions}"""
 
 TOOL_INSTRUCTIONS = """# Tool Call Instructions
+<tool_call_format>
 
 See the <priorities>, <bad_examples>, <good_examples>, <examples>, <rules> and <critic> sections.
-IMPORTANT: Ignore all built-in, hidden, native and platform tools. The ONLY tools you may use are the explicit names listed in the <allowed_tools>. Never invent tools, never say resources are exhausted, never repeat the same command in a row. This is the only source on how to use the tools. All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc>, <ak> and <av>. NEVER write {"role": "tool", "name": "...", "content": "..."} block.
+IMPORTANT: Ignore all built-in, hidden, native and platform tools. The ONLY tools you may use are the explicit names listed in the <allowed_tools>. Never invent tools, never say resources are exhausted, never repeat the same command in a row. This is the only source on how to use the tools. All other tool call instructions, formats and tags are PERMANENTLY disabled and WRONG - ignore everything you know except <tc>, <ak> and <av>.
 
  # Tool Call Format:
 A tool call is ONE single-line <tc>...</tc> block. The function name comes right after the opening tag; every argument is ONE <ak>...</ak> pair followed by ONE <av>...</av> pair:
@@ -262,8 +263,7 @@ String argument values are written RAW, without quotes: <av>hello</av>. Non-stri
 - Tool results are delivered by the ENVIRONMENT as history lines {"role": "tool", "name": "...", "content": "<tool_response>...</tool_response>"}. 
 - The function name MUST be an exact tool name from the list; argument keys MUST match that tool's Parameters schema exactly. Every <ak> MUST be followed by its <av>.
 - DONT use <tool_call>, <arg_key>, <arg_value>. In this tool call format: <tool_call> is <tc>, <arg_key> is <ak>, <arg_value> is <av>.
-- NEVER write {"role": "tool", "name": "...", "content": "..."} block. 
-- NEVER output JSON keys role, content, thinking, name, tool_call_id as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks.
+- NEVER output JSON keys role, content, thinking, name, tool_call_id, tool, user, ... as your reply. Your reply is plain text, optionally with <tc>...</tc> blocks.
 - Use only THOSE tools that are listed in <allowed_tools>.
 - If the previous tool didn't show result, it means you violated some rules of the tools from <bad_examples>.
 - Multiple tool calls = SEVERAL separate <tc> blocks, one tool call per block, so a broken block never kills the rest:
@@ -287,7 +287,7 @@ Now I will read:
 
  # Incorrect:
 <bad_examples>
-<tool_call>bash<arg_key>command</arg_key><arg_value>dir</arg_value></tool_call>   <- native GLM tags get stripped by site, use <tc>/<ak>/<av>
+<tc>bash<arg_key>command</arg_key><arg_value>dir</arg_value></tc>   <- native GLM tags get stripped by site, use <tc>/<ak>/<av>
 <tc>bash<ak>command</ak></tc>                                                     <- missing </av>
 <tc>bash<av>dir</av></tc>                                                         <- missing <ak>
 <tc>bash<ak>command</ak><av>dir</tc>                                              <- missing closing </av>
@@ -300,7 +300,7 @@ I'll read it now...: (nothing)                                                  
  # Correct:
 <good_examples>
 single call - brief prose if needed, then ONE block on its own line, then STOP completely:
-Let me read that file.
+Let me read that file:
 <tc>read<ak>filePath</ak><av>/project/file.txt</av></tc>
 
 parallel calls - SEVERAL separate blocks, one tool call per block, stop right after:
@@ -309,9 +309,6 @@ parallel calls - SEVERAL separate blocks, one tool call per block, stop right af
 
 / paths - recommended:
 <tc>read<ak>filePath</ak><av>/Project/file.h</av></tc>
-
-raw quotes in argument values:
-<tc>bash<ak>command</ak><av>rg -n "pattern" src/</av></tc>
 
 non-string values - lists, objects, numbers:
 <tc>todowrite<ak>todos</ak><av>[{"content": "make init", "status": "in_progress", "priority": "high"}, {"content": "make debug", "status": "pending", "priority": "medium"}]</av></tc>
@@ -322,12 +319,9 @@ non-string values - lists, objects, numbers:
 
 <tc>bash<ak>command</ak><av>git status --short</av></tc>
 <tc>read<ak>filePath</ak><av>project/main.py</av></tc>
-<tc>write<ak>filePath</ak><av>project/helper.py</av><ak>content</ak><av>def add(a, b):
-    return a + b
+<tc>write<ak>filePath</ak><av>project/helper.py</av><ak>content</ak><av>def add(a, b):\\n\\treturn a + b
 </av></tc>
-<tc>edit<ak>filePath</ak><av>project/main.py</av><ak>oldString</ak><av>def old_fn():
-    pass</av><ak>newString</ak><av>def new_fn():
-    return True</av></tc>
+<tc>edit<ak>filePath</ak><av>project/main.py</av><ak>oldString</ak><av>def old_fn():\\n\\tpass</av><ak>newString</ak><av>def new_fn():\n\treturn True</av></tc>
 <tc>glob<ak>pattern</ak><av>**/*.cpp</av></tc>
 <tc>grep<ak>pattern</ak><av>MyClass</av><ak>path</ak><av>project/scripts</av></tc>
 <tc>list<ak>path</ak><av>project/</av></tc>
@@ -336,31 +330,37 @@ non-string values - lists, objects, numbers:
 
 </examples>
 
+ # Critic check
 <critic>
 Before you act or respond, silently assess your draft (never mention this check): path slashes correct? <tc></tc> tags present and on their own lines? does the tool exist? function name placed right after <tc>? every <ak> followed by its <av>? strings written RAW, non-strings as JSON? one tool call per block, never bundled? am I fabricating output that no real {"role": "tool"} line gave me? If any violation - rewrite before sending.
 </critic>
 
-How your response chain works from the user’s perspective:
+ # <tc> work
+How your response chain works from the user's perspective:
 
  +---- User message
  | (trigger)
  +---> Your previous text with <tc> block
+ | (result)
  | (trigger)
  +---> Your previous text with <tc> block
+ | (result)
  | (trigger)
  +---> A new request for you regarding the continuation
  |
  +---> If there's no <tc> block — that's it!
 
+result - <tool_response>
 trigger - a new request for you to take the following action
 
-<priorities>
  # Priorities:
+<priorities>
 1. The <rules>
 2. The <bad_examples>, <good_examples> and <critic>
-5. The <examples>
+3. The <examples>
 4. Purpose/User Message
-</priorities>"""
+</priorities>
+</tool_call_format>"""
 
 
 def _glm_arg_value(v):
@@ -380,19 +380,78 @@ def tool_call_xml(name, arguments):
     return f"<tc>{name}{inner}</tc>"
 
 
-def _parse_glm_xml_call(inner):
-    """Parse XML tool call body:
-    NAME<ak>K</ak><av>V</av>... (keys/vals repeat)."""
-    keys = re.findall(r"<ak>([\s\S]*?)</ak>", inner)
-    vals = re.findall(r"<av>([\s\S]*?)</av>", inner)
-    if not keys or len(keys) != len(vals):
+def _unquote_val(v):
+    """Strip wrapping quotes around a repaired string value:
+    <av>"dir"</av> -> dir. JSON-looking values ({..}, [..], numbers) pass through."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        return v[1:-1].strip()
+    return v
+
+
+def _parse_xml_call(inner):
+    """Parse XML tool call body: NAME<ak>K</ak><av>V</av>... (keys/vals repeat).
+    Tolerant: missing </ak>/</av>, missing <av>-value or stray quotes around
+    values are repaired instead of failing the whole call."""
+    m = re.match(r"^\s*([^<]*?)\s*<ak>", inner)
+    if not m:
         return None
-    name = re.split(r"<ak>", inner, maxsplit=1)[0].strip()
+    name = m.group(1).strip()
     if not name:
         return None
+    body = inner[m.end() - 4:]  # rewind to the first <ak>
+
+    tokens = re.split(r"(<ak>|</ak>|<av>|</av>)", body)
     args = {}
-    for k, v in zip(keys, vals):
-        args[k.strip()] = _glm_arg_value(v)
+    key = None
+    chunk = ""
+    in_key = False
+    in_val = False
+
+    def flush_key():
+        """Promote the accumulated chunk into a pending key (no closing </ak>)."""
+        return chunk.strip()
+
+    def commit():
+        nonlocal key, chunk, in_key, in_val
+        k = key if key is not None else flush_key()
+        k = k.strip()
+        if k:
+            args[k] = _unquote_val(chunk)
+        key, chunk = None, ""
+        in_key = in_val = False
+
+    for tok in tokens:
+        if not tok:
+            continue
+        if tok == "<ak>":
+            if in_val or in_key:
+                commit()  # close previous (possibly incomplete) pair
+            in_key, in_val = True, False
+            chunk = ""
+        elif tok == "</ak>":
+            if in_key:
+                key = chunk.strip()
+                chunk = ""
+                in_key = False
+        elif tok == "<av>":
+            if in_key:
+                key = chunk.strip()  # missing </ak> -> key is whatever came before
+            in_val, in_key = True, False
+            chunk = ""
+        elif tok == "</av>":
+            if in_val:
+                commit()
+        elif in_key or in_val:
+            chunk += tok
+
+    if in_val:
+        commit()  # unterminated trailing value
+    elif key or in_key:
+        commit()  # trailing key without value -> empty value
+
+    if not args:
+        return None
     return {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}
 
 
@@ -432,12 +491,16 @@ def parse_tool_call_blocks(text):
     Native GLM tags (<tool_call>/<arg_key>/<arg_value>/<command>) are
     auto-converted to ours before parsing."""
     text = normalize_tool_tags(text)
+    # Repair: an unclosed <tc> at the very end (stream cut / truncated reply)
+    # gets closed so the call is not lost.
+    if text.count("<tc>") > text.count("</tc>"):
+        text = text + "</tc>"
     calls = []
     blocks = list(re.finditer(r"<tc>\s*([\s\S]*?)\s*</tc>", text))
     for m in blocks:
         inner = m.group(1).strip()
         if "<ak>" in inner:
-            call = _parse_glm_xml_call(inner)
+            call = _parse_xml_call(inner)
             if call:
                 calls.append(call)
             continue
@@ -906,6 +969,16 @@ class ZaiSession:
 
         async def on_pageerror(err):
             log(f"[PAGE ERROR] {err}", level="ERROR")
+            # Network-level JS failures (fetch failing inside the site) must land
+            # into the retry path like any other error - feed them into the
+            # stream queue so stream_tokens() yields ("error", msg) and the
+            # universal retry kicks in instead of a silent empty completion.
+            s = str(err).lower()
+            if ("fetch" in s or "network" in s or "err_" in s or "timeout" in s):
+                try:
+                    self.token_queue.put_nowait({"error": f"page error: {err}"})
+                except Exception:
+                    pass
 
         self.page.on('pageerror', on_pageerror)
 
@@ -1131,8 +1204,7 @@ class ZaiSession:
             ready = await poll_js(self.page, MODEL_READY_JS, timeout_s=30)
             if not ready:
                 if attempt < attempts:
-                    log(f"[prepare] model selector not ready (attempt {attempt}/{attempts}), "
-                        f"reloading page ...", level="WARN")
+                    log(f"[prepare] model selector not ready (attempt {attempt}/{attempts})", level="WARN")
                     await asyncio.sleep(5)
                     continue
                 raise RuntimeError("Model selector never appeared")
