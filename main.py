@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import json
 import re
 import secrets
 import subprocess
+import tempfile
 import time
+import urllib.request
 import uuid
 import sys
 import os
@@ -546,6 +549,8 @@ class ToolStreamBuffer:
         # The only state this needs: a call has been delivered, so anything the
         # model writes from now on is filler and is never handed back.
         self.done = False
+        # "stop" is announced once, not on every further chunk of that prose.
+        self.stopped = False
 
     def feed(self, delta):
         """Consume a delta and return events IN ORDER, as a list of tuples:
@@ -574,14 +579,14 @@ class ToolStreamBuffer:
                     if self.done:
                         # After a call, anything that cannot grow into another
                         # <tc> block is prose the model invented - drop it and
-                        # tell the caller to stop. A half-typed tag is held
+                        # tell the caller to stop. A half-typed tag is kept
                         # instead, so a sibling parallel block still lands.
                         if hold:
                             self.buf = self.buf[len(self.buf) - hold:]
-                        elif self.buf.strip():
-                            events.append(("stop", None))
-                            self.buf = ""
                         else:
+                            if self.buf.strip() and not self.stopped:
+                                self.stopped = True
+                                events.append(("stop", None))
                             self.buf = ""
                     elif hold:
                         events.append(("text", self.buf[: len(self.buf) - hold]))
@@ -816,6 +821,94 @@ def _hide_windows_for_pids(pids):
         return True
 
     user32.EnumWindows(_enum_cb, 0)
+
+
+# ===== MEDIA (image / video attachments) =====
+
+MEDIA_UPLOAD_WAIT = 4.0        # seconds to let the site finish uploading
+# The composer's "+" button. It carries a stable id (unlike the hashed classes)
+# and opens a native file picker, so the files are handed over through a
+# filechooser event - filling the hidden <input type=file> directly does NOT
+# work here, React recreates that input and drops the files.
+UPLOAD_BTN_SEL = "#upload-file-button"
+# The site's own tooltip states the limits: up to 10 files, 50 MB each.
+MEDIA_MAX_FILES = 10
+MEDIA_MAX_BYTES = 50 * 1024 * 1024
+# Exactly what the site's own file input accepts (read off its accept attribute
+# on a live page): .png .jpg .jpeg .svg .bmp .gif and .mp4. webp, webm, mov
+# and mkv are NOT accepted, so they are dropped here instead of being uploaded
+# and silently ignored; audio (.mp3) and documents (.pdf .docx ...) work too
+# but are out of scope for now.
+IMAGE_MIMES = ("image/png", "image/jpeg", "image/jpg", "image/bmp",
+               "image/gif", "image/svg+xml")
+VIDEO_MIMES = ("video/mp4",)
+_EXT_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+             "svg": "image/svg+xml", "bmp": "image/bmp", "gif": "image/gif",
+             "mp4": "video/mp4"}
+_EXT_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+               "image/bmp": ".bmp", "image/gif": ".gif",
+               "image/svg+xml": ".svg", "video/mp4": ".mp4"}
+
+def collect_media_parts(messages):
+    """Pull image and video parts out of OpenAI-style messages.
+
+    build_prompt keeps only the text, so media has to travel the way the site
+    does it: as uploaded attachments. Accepted shapes are the ones clients
+    actually send - {"type": "image_url", "image_url": {"url"}} and its video
+    siblings (video_url / input_video / input_image), plus a "file" part. Data
+    URLs, http(s) URLs and local paths are all accepted; remote ones are
+    fetched here so the upload only ever deals with local files.
+    """
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type") or ""
+            if kind in ("image_url", "video_url", "input_video", "input_image"):
+                holder = part.get(kind)
+            elif kind == "file":
+                holder = part.get("file")
+            else:
+                continue
+            if isinstance(holder, str):
+                url = holder
+            elif isinstance(holder, dict):
+                url = (holder.get("url") or holder.get("file_data")
+                       or holder.get("path") or holder.get("file_id") or "")
+            else:
+                continue
+            if not isinstance(url, str) or not url:
+                continue
+            try:
+                if url.startswith("data:"):
+                    head, _, b64 = url.partition(",")
+                    mime = (head[5:].split(";")[0] or "").strip().lower()
+                    if mime in IMAGE_MIMES + VIDEO_MIMES:
+                        out.append({"data": base64.b64decode(b64), "mime": mime})
+                elif url.startswith(("http://", "https://")):
+                    with urllib.request.urlopen(url, timeout=60) as r:
+                        blob = r.read()
+                        mime = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    if not mime:
+                        ext = os.path.splitext(url.split("?")[0])[1].lstrip(".").lower()
+                        mime = _EXT_MIME.get(ext, "")
+                    if mime in IMAGE_MIMES + VIDEO_MIMES:
+                        out.append({"data": blob, "mime": mime})
+                    else:
+                        log(f"[media] skipped unsupported type "
+                            f"{mime or '?'}: {url[:70]}", level="WARN")
+                elif os.path.isfile(url):
+                    with open(url, "rb") as fh:
+                        blob = fh.read()
+                    ext = os.path.splitext(url)[1].lstrip(".").lower()
+                    out.append({"data": blob, "mime": _EXT_MIME.get(ext, "image/png")})
+            except Exception as e:
+                log(f"[media] skipped part ({e})", level="WARN")
+    return out
 
 
 class ZaiSession:
@@ -1303,10 +1396,58 @@ class ZaiSession:
         if not confirmed:
             raise RuntimeError(f"Could not select model {model_id}")
 
-    async def send_message(self, prompt):
+    async def _attach_media(self, images):
+        """Hand image/video files to the site's own picker.
+
+        The composer's "+" button (#upload-file-button) opens a native file
+        picker, so the files are passed through the filechooser event it raises.
+        Setting them on the hidden <input type=file> directly does not survive
+        this site - React recreates that input and the files are dropped - which
+        is why the picker is used instead of the DeepSeek proxy's approach.
+        The prompt text is unchanged: build_prompt keeps only the text parts."""
+        if len(images) > MEDIA_MAX_FILES:
+            log(f"[media] {len(images)} files is over the site's limit of "
+                f"{MEDIA_MAX_FILES}, dropping the rest", level="WARN")
+            images = images[:MEDIA_MAX_FILES]
+        paths = []
+        try:
+            for blob in images:
+                if len(blob["data"]) > MEDIA_MAX_BYTES:
+                    log(f"[media] {blob.get('mime')} is over the site's 50 MB "
+                        f"limit, dropped", level="WARN")
+                    continue
+                fd, path = tempfile.mkstemp(prefix="zaiimg", suffix=_EXT_SUFFIX.get(
+                    blob.get("mime", ""), ".png"))
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(blob["data"])
+                paths.append(path)
+            if not paths:
+                return
+            btn = self.page.locator(UPLOAD_BTN_SEL).first
+            await btn.wait_for(state="visible", timeout=15000)
+            async with self.page.expect_file_chooser(timeout=15000) as fc_info:
+                await btn.click()
+            chooser = await fc_info.value
+            await chooser.set_files(paths)
+            # the site uploads asynchronously
+            await asyncio.sleep(MEDIA_UPLOAD_WAIT)
+        finally:
+            for p_ in paths:
+                try:
+                    os.unlink(p_)
+                except OSError:
+                    pass
+
+    async def send_message(self, prompt, media=None):
         # drain stale tokens
         while not self.token_queue.empty():
             self.token_queue.get_nowait()
+
+        # Attach BEFORE the text is typed: the composer clears its attachment
+        # list when it is emptied, and the site only uploads once the send is
+        # actually on its way.
+        if media:
+            await self._attach_media(media)
 
         await self._fill_and_send(prompt)
 
@@ -1642,6 +1783,7 @@ async def chat_completions(request: Request):
     prompt, _last_user = session.build_prompt(messages, tools=body.get("tools"))
     thinking_level = session.map_thinking(body.get("reasoning_effort"))
     has_tools = bool(body.get("tools"))
+    media = collect_media_parts(messages)
     prompt_len = len(prompt)
     log(f"<-- request: history msgs={len(messages)} prompt_len={prompt_len} | model={req_model}")
 
@@ -1680,7 +1822,7 @@ async def chat_completions(request: Request):
                 try:
                     await wk.prepare_chat(req_model)
                     await wk.set_thinking(thinking_level)
-                    await wk.send_message(prompt)
+                    await wk.send_message(prompt, media=media)
                 except Exception as e:
                     # a captcha/block during prepare also reloads forever
                     if await wk.is_captcha() and CAPTCHA_BYPASS:
@@ -1868,7 +2010,7 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
             try:
                 await wk.prepare_chat(req_model)
                 await wk.set_thinking(thinking_level)
-                await wk.send_message(prompt)
+                await wk.send_message(prompt, media=media)
             except Exception as e:
                 # a captcha/block during prepare also reloads forever
                 if await wk.is_captcha() and CAPTCHA_BYPASS:
