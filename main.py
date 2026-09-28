@@ -10,8 +10,15 @@ import urllib.request
 import uuid
 import sys
 import os
+import shutil
+import threading
 import webbrowser
 from datetime import datetime
+
+try:
+    from deepseek_tokenizer import ds_token
+except ImportError:      # optional: the counters fall back to characters
+    ds_token = None
 
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request
@@ -32,6 +39,11 @@ REQUEST_COOLDOWN = 0               # seconds between requests, avoids captcha on
 TOOL_CALL_DELAY = 0.5              # seconds between parallel tool-call chunks, avoids Busy errors in the client
 MAX_REQUEST_RETRIES = 4            # max captcha/fetch retries per request before giving up
 ACCOUNTS_FILE = "accounts.json"
+RESIZE_WAIT = 2.0                   # seconds to wait for the terminal to honour a resize request
+
+# Persistent token/character counters, shown on the startup screen. Kept next
+# to the script (not in CWD) so the numbers follow it wherever it is run from.
+STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1978,6 +1990,9 @@ async def chat_completions(request: Request):
                 log(f"--> done: reasoning={sum(len(x) for x in full_reasoning)}ch "
                     f"answer={sum(len(x) for x in full_answer)}ch "
 f"prompt_len={prompt_len} | model={req_model}", level="OK")
+                USAGE.add("Reasoning" if thinking_level != "off" else "Chat", prompt,
+                          reasoning="".join(full_reasoning),
+                          answer="".join(full_answer))
                 with open("last_response.json", "w", encoding="utf-8") as f:
                     json.dump({"reasoning": "".join(full_reasoning), "answer": "".join(full_answer)},
                               f, ensure_ascii=False, indent=2)
@@ -2100,6 +2115,8 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
     log(f"--> done: reasoning={sum(len(x) for x in reasoning_parts)}ch "
         f"answer={sum(len(x) for x in answer_parts)}ch "
         f"prompt_len={prompt_len} | model={req_model}", level="OK")
+    USAGE.add("Reasoning" if thinking_level != "off" else "Chat", prompt,
+              reasoning="".join(reasoning_parts), answer="".join(answer_parts))
     if has_tools:
         calls = parse_tool_call_blocks(raw_answer)
         if calls:
@@ -2163,7 +2180,14 @@ def _enable_ansi():
 
 
 def _clear():
-    os.system("cls" if os.name == "nt" else "clear")
+    """Blank the screen, and put the mouse mode back if it was on."""
+    # Not os.system("cls"): that spawns cmd.exe, which inherits the console and
+    # leaves its own input mode behind on the way out - Quick Edit comes back, the
+    # wheel is swallowed again, and it only ever scrolls once.
+    sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
+    sys.stdout.flush()
+    if os.name == "nt" and globals().get("_OLD_MODE") is not None:
+        _mouse_console(True)        # in case anything above reset the mode
 
 
 def _tick(on):
@@ -2183,6 +2207,54 @@ def _term_width():
     except Exception:
         return 80
 
+
+_LAST_AUTO_WIDTH = 0
+
+
+def _ensure_terminal_width(min_w=None):
+    """Grow the terminal to fit the banner, via XTWINOPS.
+
+    CSI 8 ; rows ; cols t resizes the text area in character cells. It is
+    honoured by xterm and every emulator that follows it (kitty, alacritty,
+    wezterm, gnome-terminal, konsole, foot, iTerm2). One that does not simply
+    ignores the bytes, so this is safe to send without probing first.
+
+    Only the width is touched. The height is left to the terminal: Windows
+    always keeps one spare row when it grows a window, so asking for an exact
+    height lands on a screen one row bigger than the block and puts a blank line
+    at the bottom. The menu is laid out to fit the window instead.
+    """
+    global _LAST_AUTO_WIDTH
+    if min_w is None:
+        min_w = _logo_width()
+    cur = _term_width()
+    if cur <= 0 or cur >= min_w:
+        _LAST_AUTO_WIDTH = 0
+        return cur
+    if _LAST_AUTO_WIDTH == min_w:
+        return cur
+    _LAST_AUTO_WIDTH = min_w
+    try:
+        rows = max(shutil.get_terminal_size().lines, 25)
+        sys.stdout.write("\x1b[8;%d;%dt" % (rows, min_w))
+        sys.stdout.flush()
+    except Exception:
+        return cur
+    # Do NOT settle for a fixed pause: the emulator applies the resize on its
+    # own schedule, and the first frame is laid out from whatever width is in
+    # effect when it is drawn. Returning early is what clipped the banner - the
+    # layout was measured against the old width and nothing repainted it later.
+    deadline = time.time() + RESIZE_WAIT
+    while time.time() < deadline and _term_width() < min_w:
+        time.sleep(0.02)
+    grown = _term_width()
+    if grown < min_w:
+        # Keep _LAST_AUTO_WIDTH set so we do not spam a terminal that will
+        # never grow. It resets to 0 as soon as the width is enough, so a
+        # manual resize re-arms the check.
+        log(f"[menu] terminal is {grown} cols, banner needs {min_w} "
+            f"- it ignored the resize request, banner will wrap", level="WARN")
+    return grown
 
 def _center(s, width=None):
     """Center a plain (non-ANSI) string on a terminal line."""
@@ -2216,13 +2288,571 @@ def _gradient_lines(lines, width):
     return out
 
 
-def _render_menu():
-    _enable_ansi()
-    _clear()
-    w = _term_width()
-    for line in _gradient_lines(LOGO.splitlines(), w):
-        print(line)
-    print()
+# ===== USAGE STATS =====
+# Split by the DeepThink switch: "Reasoning" is the reasoner model, "Chat" is
+# plain completion. Every counter is cumulative across runs.
+USAGE_GROUPS = ("Chat", "Reasoning")
+USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+                "prompt_chars", "answer_chars")
+
+
+def count_tokens(text):
+    """DeepSeek tokens, or 0 when the tokenizer is unavailable."""
+    if not text or ds_token is None:
+        return 0
+    try:
+        return len(ds_token.encode(text))
+    except Exception:
+        return 0
+
+
+class Usage:
+    """Token/character counters persisted next to the script.
+
+    Tokenizing a large prompt costs about a second, so counting happens on a
+    background thread: the request returns as soon as the answer is done, and
+    the startup screen catches up a moment later.
+    """
+
+    def __init__(self, path=STATS_FILE):
+        self.path = path
+        self.lock = threading.Lock()
+        self.groups = {g: dict.fromkeys(USAGE_FIELDS, 0) for g in USAGE_GROUPS}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                saved = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+        for name, row in (saved.get("groups") or {}).items():
+            target = self.groups.setdefault(name, dict.fromkeys(USAGE_FIELDS, 0))
+            for field in USAGE_FIELDS:
+                target[field] = int(row.get(field) or 0)
+
+    def save(self):
+        with self.lock:
+            snapshot = {g: dict(r) for g, r in self.groups.items()}
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"groups": snapshot}, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)     # atomic: never a half-written stats.json
+        except Exception as e:
+            log(f"[stats] could not save: {e}", level="ERROR")
+
+    def add(self, group, prompt="", reasoning="", answer=""):
+        """Count one finished request without blocking the caller."""
+        threading.Thread(target=self._add, args=(group, prompt, reasoning, answer),
+                         daemon=True).start()
+
+    def _add(self, group, prompt, reasoning, answer):
+        row = self.groups.setdefault(group, dict.fromkeys(USAGE_FIELDS, 0))
+        with self.lock:
+            row["prompt_tokens"] += count_tokens(prompt)
+            row["completion_tokens"] += count_tokens(answer)
+            row["reasoning_tokens"] += count_tokens(reasoning)
+            row["prompt_chars"] += len(prompt)
+            row["answer_chars"] += len(answer)
+        self.save()
+
+    def snapshot(self):
+        """{group: {field: value}} plus the grand total, as a flat copy."""
+        with self.lock:
+            rows = {g: dict(r) for g, r in self.groups.items()}
+        total = dict.fromkeys(USAGE_FIELDS, 0)
+        for row in rows.values():
+            for field in USAGE_FIELDS:
+                total[field] += row.get(field, 0)
+        return rows, total
+
+
+USAGE = Usage()
+
+
+# Rows that share the token scale; Characters is not one of them, it is counted
+# in symbols and would print 400% on a token scale.
+_TOKEN_ROWS = ("Prompt Tokens", "Completion Tokens", "Reasoning Tokens", "Tokens")
+
+
+def _metric_values(row):
+    """Counters in the order they are shown, including the derived totals."""
+    return [
+        ("Prompt Tokens", row["prompt_tokens"]),
+        ("Completion Tokens", row["completion_tokens"]),
+        ("Reasoning Tokens", row["reasoning_tokens"]),
+        ("Tokens", row["prompt_tokens"] + row["completion_tokens"]),
+        ("Characters", row["prompt_chars"] + row["answer_chars"]),
+    ]
+
+
+def _spaced(n):
+    """1 234 567 - thin spaces, the way the counters are read out loud."""
+    return f"{int(n):,}".replace(",", " ")
+
+
+def room_for(head, width, extra=6):
+    """How many cells a bar may take on a row that already starts with `head`.
+
+    The bar is sized from the row being built rather than from a hand-counted
+    constant, so no column can be added or removed without the width following.
+    The line must stay shorter than the terminal: one that fills it exactly
+    leaves the cursor in pending-wrap, and the row count the caret arithmetic
+    depends on stops being reliable. `extra` covers the " |" separators plus the
+    spare column, and any "|  n%" already appended to the head.
+    """
+    return max(10, width - _visible_len(head) - extra)
+
+
+# The bars use the banner's palette, so the screen reads as one thing, but each
+# bar runs the ramp along its own length instead of continuing the banner's
+# 45-degree diagonal - the banner is a picture, the counters are a scale.
+def _bar(fraction, width, minimum=False):
+    filled = int(round(fraction * width))
+    if minimum and filled == 0:
+        filled = 1                      # real usage must not render as an empty bar
+    cells = []
+    for i in range(width):
+        if i < filled:
+            cells.append(_ansi_color(i / max(1, width - 1)) + "█" + RESET)
+        else:
+            cells.append(ANSI["DIM"] + "." + RESET)
+    return "".join(cells)
+
+
+# Group key -> heading. The split follows the reasoning switch, so it tracks
+# what actually costs tokens rather than the model list, which the site serves
+# dynamically.
+# Group key -> heading. The split follows the reasoning switch, so it tracks
+# what actually costs tokens rather than the model list, which the site serves
+# dynamically.
+GROUP_TITLES = (("Chat", "GLM Chat"), ("Reasoning", "GLM Reasoning"))
+
+
+def _stats_lines(width):
+    """The usage block, flush left, with bars sized to the current terminal.
+
+    Each bar is that group's share of the same counter across everything, so
+    the numbers stay meaningful without inventing a quota: "All" is always
+    100% and a group is whatever slice of it it has actually used."""
+    rows, total = USAGE.snapshot()
+    if not any(total.values()):
+        # Nothing has been served yet (a fresh stats.json). A block of zeroes
+        # and full bars says less than showing no block at all.
+        return []
+    grand = _metric_values(total)
+    grand_map = dict(grand)
+
+    # The number column is sized to the widest value the block will actually
+    # print, not to a fixed width: a block that has not grown past six digits
+    # should not be padded to room for eleven, and one that has should not
+    # start shoving its bars off the right edge.
+    per_group = {g: _metric_values(rows.get(g) or dict.fromkeys(USAGE_FIELDS, 0))
+                 for g, _ in GROUP_TITLES}
+    every = list(grand) + [v for values in per_group.values() for v in values]
+    value_w = max((len(_spaced(v)) for _, v in every), default=1)
+
+    out = [" Stats:"]
+
+    # One denominator per block, stated once, and it is the headline number the
+    # eye lands on: total Tokens. Everything else is read against that, so
+    # "Completion Tokens: 199 | 1%" means 199 out of 20 972 rather than 199 out
+    # of 199 - which is how it read before, sitting right above a Tokens row and
+    # claiming 100%.
+    #
+    # Characters is deliberately left out of the bars. Symbols outnumber tokens
+    # about four to one, so sharing that scale would print 400%; a row that
+    # cannot live in the same unit is printed as a plain number instead of
+    # given a scale it does not belong to.
+    # Every row is measured against the SAME counter in the All block, never
+    # against its own group's total: "Completion Tokens: 143" next to "Tokens"
+    # must read as a share of all tokens, and showing 100% because 143 is all of
+    # this group's completion tokens is true but useless. Characters is a
+    # different unit - symbols outnumber tokens about four to one - so it is
+    # measured against All Characters, the one comparison that holds.
+    token_total = grand_map.get("Tokens", 0)
+    chars_total = grand_map.get("Characters", 0)
+
+    def pct_text(share):
+        # A real but tiny share must not round to a flat "0%": that would say a
+        # group did nothing when it did.
+        if share >= 1:
+            return str(int(round(share)))
+        if share >= 0.01:
+            return f"{share:.2f}"
+        return "<0.01"
+
+    def block(title, values, is_total):
+        lines = [f"  {title}:"]
+        for name, value in values:
+            if not value and not is_total:
+                continue                      # a group without reasoning shows no reasoning row
+            label = name.rjust(17)
+            head = f"  - {label}: {_spaced(value).rjust(value_w)}"
+            if is_total:
+                lines.append(f"{head} | {_bar(1.0, room_for(head, width))} |")
+                continue
+            whole = chars_total if name == "Characters" else token_total
+            share = (value * 100 / whole) if whole else 0.0
+            head += f" | {pct_text(share).rjust(4)}%"
+            # The bar is sized from the row that is actually being built, so the
+            # line can never reach the terminal width. room_for() has to see the
+            # percentage too: measuring the head before the "|  93%" is appended
+            # leaves the row several columns too long, which is how a bar ends up
+            # wrapping the line and dragging the whole block down.
+            room = room_for(head, width)
+            lines.append(f"{head} | {_bar(share / 100, room, minimum=bool(value))} |")
+        return lines
+
+    out += block("All", grand, True)
+    for group, title in GROUP_TITLES:
+        if any(rows.get(group, {}).values()):
+            out += [""] + block(title, per_group[group], False)
+    return out
+
+
+def _logo_width():
+    return max(_visible_len(l) for l in LOGO.splitlines())
+
+
+def _stats_viewport(w, offset, chrome):
+    """The stats block as it fits on screen, starting at `offset`.
+
+    The whole screen is held to the terminal height minus one row: the last row
+    is left free, because a terminal that scrolls shifts every row and the caret
+    walk at the end of _render_menu counts them. The heading itself is pinned: the
+    rows under it are what the wheel moves, so the block keeps its heading no
+    matter how far it is scrolled. When the whole thing fits there is nothing to
+    scroll and the block is returned as is.
+    """
+    counters = _stats_lines(w)
+    if not counters:
+        return [], 0
+    height = _term_height()
+    if not height:            # size unknown: no guessing, show the whole block
+        return counters, 0
+    head, rows = counters[0], counters[1:]
+    # the block is chrome + a blank line + this heading + the rows below it, and
+    # all of it has to fit in the height minus one row, so the rows get the rest
+    room = height - 3 - chrome
+    if room < 1:
+        return [], 0        # not even a heading and one row: no stats block
+    if len(rows) <= room:
+        return counters, 0
+    last = len(rows) - room
+    offset = max(0, min(offset, last))
+    # the heading has to say the block is cut, or a half-looking list of counters
+    # reads as the whole thing
+    head = head.replace("Stats:", "Stats (scroll):")
+    return [head] + rows[offset:offset + room], last
+
+
+def _term_height():
+    """Rows on the visible screen, or 0 when it cannot be measured."""
+    try:
+        return os.get_terminal_size().lines
+    except Exception:
+        return 0
+
+
+# The wheel arrives as an SGR mouse report: ESC [ < button ; col ; row M,
+# with 64 for up and 65 for down. It only comes while mouse reporting is on,
+# which is why that is switched on only when there is something to scroll.
+# --- input ---------------------------------------------------------------------
+# On Windows the wheel is not a character: it arrives as a MOUSE_EVENT record in
+# the console input buffer, and ReadConsoleW - which is what msvcrt.getwch() calls
+# - never returns records. Two things are needed and both were missing at once:
+#   * ENABLE_MOUSE_INPUT in the console mode, without which the console does not
+#     generate mouse events at all and the wheel is never reported;
+#   * the right event type: MOUSE_EVENT is 0x0002, while 0x0004 is MENU_EVENT, so
+#     a record that does arrive gets thrown away by a wrong comparison.
+# Set PROXY_DEBUG_INPUT=1 to see every input event reach the menu.
+_DEBUG_INPUT = bool(os.environ.get("PROXY_DEBUG_INPUT"))
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _K = ctypes.WinDLL("kernel32", use_last_error=True)
+    _K.GetStdHandle.restype = wintypes.HANDLE
+    _K.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _K.GetConsoleMode.restype = wintypes.BOOL
+    _K.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _K.SetConsoleMode.restype = wintypes.BOOL
+    _K.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _K.WaitForSingleObject.restype = wintypes.DWORD
+    _K.ReadConsoleInputW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                    ctypes.POINTER(wintypes.DWORD)]
+    _K.ReadConsoleInputW.restype = wintypes.BOOL
+
+    _KEY_EVENT = 0x0001
+    _MOUSE_EVENT = 0x0002
+    _MOUSE_WHEELED = 0x0004
+    _ENABLE_MOUSE_INPUT = 0x0010
+    _ENABLE_EXTENDED_FLAGS = 0x0080
+    # Quick Edit is on by default and it swallows the wheel for text selection
+    # instead of letting the events reach the input buffer, so it has to go.
+    _ENABLE_QUICK_EDIT = 0x0040
+
+    # the virtual keys that move a view
+    _SCROLL_KEYS = {0x26: -1, 0x28: 1, 0x21: -3, 0x22: 3}    # up, down, PgUp, PgDn
+    _SPECIAL_KEYS = {0x0D: "\r", 0x08: "\x7f", 0x1B: "\x1b", 0x09: "\t"}
+    _OLD_MODE = None
+
+    class _Coord(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    class _KeyRecord(ctypes.Structure):
+        _fields_ = [("keyDown", wintypes.BOOL), ("repeatCount", wintypes.WORD),
+                    ("keyCode", wintypes.WORD), ("scanCode", wintypes.WORD),
+                    ("char", wintypes.WCHAR), ("control", ctypes.c_ubyte * 8)]
+
+    class _MouseRecord(ctypes.Structure):
+        _fields_ = [("pos", _Coord), ("buttonState", wintypes.DWORD),
+                    ("control", wintypes.DWORD), ("flags", wintypes.DWORD)]
+
+    class _Record(ctypes.Structure):
+        class _U(ctypes.Union):
+            _fields_ = [("key", _KeyRecord), ("mouse", _MouseRecord)]
+        _fields_ = [("kind", wintypes.WORD), ("u", _U)]
+
+    def _mouse_console(on):
+        """Mouse reports from the console itself, restoring the old mode after."""
+        global _OLD_MODE
+        handle = _K.GetStdHandle(-10)
+        mode = wintypes.DWORD()
+        if not _K.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        if on:
+            if _OLD_MODE is None:
+                _OLD_MODE = mode.value
+            _K.SetConsoleMode(handle, (mode.value | _ENABLE_MOUSE_INPUT
+                                     | _ENABLE_EXTENDED_FLAGS) & ~_ENABLE_QUICK_EDIT)
+        elif _OLD_MODE is not None:
+            _K.SetConsoleMode(handle, _OLD_MODE)
+            _OLD_MODE = None
+
+    def _win_event(rec):
+        """One console record as a scroll delta, a character, or None to skip."""
+        if rec.kind == _MOUSE_EVENT:
+            if not rec.u.mouse.flags & _MOUSE_WHEELED:
+                return None
+            # the step is a signed value in the high word; a plain shift would read
+            # an upward wheel as 65535 and then call it a downward one
+            step = ctypes.c_short(rec.u.mouse.buttonState >> 16).value
+            return -1 if step > 0 else 1
+        if rec.kind != _KEY_EVENT or not rec.u.key.keyDown:
+            return None
+        vk = rec.u.key.keyCode
+        if vk in _SCROLL_KEYS:
+            return _SCROLL_KEYS[vk]
+        if vk in _SPECIAL_KEYS:
+            return _SPECIAL_KEYS[vk]
+        ch = rec.u.key.char
+        if not ch:
+            return None
+        if ord(ch) == 32 and vk != 0x20:
+            return None        # a key that types nothing leaves a space behind
+        if ord(ch) >= 32 or ch == "\x03":
+            return ch           # printable, and Ctrl+C which the console sends as 3
+        return None
+
+    def _getch():
+        """One input event: a character, or a scroll delta."""
+        if _PENDING_KEY:
+            return _PENDING_KEY.pop(0)
+        if os.name == "nt":
+            handle = _K.GetStdHandle(-10)
+            rec, got = _Record(), wintypes.DWORD()
+            while True:
+                _K.WaitForSingleObject(handle, 1000)
+                if not _K.ReadConsoleInputW(handle, ctypes.byref(rec),
+                                            ctypes.sizeof(rec), ctypes.byref(got)) or not got.value:
+                    continue
+                event = _win_event(rec)
+                if event is not None:
+                    return event
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+
+# How long a wheel gesture is allowed to keep feeding us events before the screen
+# is repainted, and where a key waits if it turns up in the middle of one.
+SCROLL_DRAIN = 0.03
+_PENDING_KEY = []
+
+
+def _getch_nowait():
+    """One input event if one is already waiting, else None. Never blocks."""
+    if _PENDING_KEY:
+        return _PENDING_KEY.pop(0)
+    if os.name == "nt":
+        handle = _K.GetStdHandle(-10)
+        if _K.WaitForSingleObject(handle, 0) != 0:
+            return None
+        rec, got = _Record(), wintypes.DWORD()
+        if not _K.ReadConsoleInputW(handle, ctypes.byref(rec), ctypes.sizeof(rec),
+                                    ctypes.byref(got)) or not got.value:
+            return None
+        return _win_event(rec)
+    return None            # no non-blocking read to borrow on this platform
+
+
+def _scroll_mouse(on):
+    """Ask the terminal to report the wheel. Not needed on Windows, where the
+    console reports it on its own once ENABLE_MOUSE_INPUT is set."""
+    if os.name == "nt":
+        _mouse_console(on)
+        return
+    sys.stdout.write("\x1b[?1000h\x1b[?1006h" if on else "\x1b[?1006l\x1b[?1000l")
+    sys.stdout.flush()
+
+
+def _read_event(getch):
+    """One key or one scroll delta, from either kind of terminal."""
+    ch = getch()
+    if isinstance(ch, int) or ch != "\x1b":
+        return ch
+    # SGR mouse report: ESC [ < button ; col ; row M, where 64 is up and 65 down
+    seq = [ch]
+    for _ in range(12):
+        try:
+            nxt = getch()
+        except Exception:
+            break
+        if not isinstance(nxt, str):
+            return nxt
+        seq.append(nxt)
+        if nxt in ("M", "m") and len(seq) > 2:
+            m = re.match(r"\x1b\[<(\d+);\d+;\d+[Mm]$", "".join(seq))
+            if not m:
+                return None
+            button = int(m.group(1))
+            return -1 if button == 64 else (1 if button == 65 else None)
+        if not (nxt.isdigit() or nxt in ";<["):
+            break
+    return None
+
+
+def _input_limit(prompt=" Choice: "):
+    """How many characters still fit on the prompt line.
+
+    One column is left over on purpose: a line that reaches exactly the terminal
+    width wraps, and a wrapped input line pushes the whole block down - the
+    'Stats' heading disappears and the bars smear. The caret arithmetic further
+    down depends on those rows staying put.
+    """
+    return max(1, _term_width() - _visible_len(prompt) - 1)
+
+
+def _read_line(limit, getch=None, on_scroll=None, mouse=False):
+    """Read a single line, echoing as we go, and never let it exceed `limit`.
+
+    input() has no such cap, and the menu screen is already drawn underneath the
+    prompt, so a line that wraps does not just look wrong - it moves the counters
+    the caret was just walked up from.
+
+    A scroll event is not a keystroke: it moves the stats block through on_scroll
+    and stays out of the text. Reporting is switched on only when the caller says
+    the block overflows, so a menu that fits leaves the mouse to the terminal.
+    """
+    if getch is None and not sys.stdin.isatty():   # piped: nothing to echo
+        return input()
+    getch = getch or _getch
+    if mouse:
+        _scroll_mouse(True)
+    buf = ""
+    try:
+        while True:
+            key = _read_event(getch)
+            if key is None:                         # a sequence that is not ours
+                continue
+            if isinstance(key, int) and on_scroll:  # a scroll, not a key
+                # One notch of the wheel is not one event: Windows sends several
+                # records for it, and redrawing per record means clearing the
+                # screen several times a gesture - the terminal visibly blanks.
+                # Take everything that is already queued, one repaint per gesture.
+                total = key
+                waited = 0.0
+                while waited < SCROLL_DRAIN:
+                    nxt = _getch_nowait()
+                    if nxt is None:
+                        waited += 0.005
+                        continue
+                    waited = 0.0
+                    if isinstance(nxt, int):
+                        total += nxt
+                    else:
+                        _PENDING_KEY.append(nxt)    # a key arrived, keep it
+                        break
+                if _DEBUG_INPUT:
+                    print(f"[input] scroll {total:+d}", file=sys.stderr, flush=True)
+                on_scroll(total, buf)
+                continue
+            ch = key
+            if ch in ("\r", "\n"):
+                return buf
+            if ch == "\x03":                        # Ctrl+C
+                raise KeyboardInterrupt
+            if ch in ("\x7f", "\x08"):             # Backspace
+                if buf:
+                    buf = buf[:-1]
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if len(buf) < limit and (ch.isprintable() or ch == " "):
+                buf += ch
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+            # anything past the limit is dropped, so the line cannot wrap
+    finally:
+        if mouse:
+            _scroll_mouse(False)
+
+
+def _repaint_band(lines, first_row):
+    """Redraw a screen band in place, leaving the rest of the screen alone.
+
+    The whole screen is not cleared: only the rows that changed, one cursor
+    move each and an erase-to-end-of-line. That is what keeps a wheel step from
+    flashing - the banner is thousands of escape bytes per character, and
+    reprinting it takes long enough for the blank frame to be visible.
+    """
+    out = [f"\x1b[{first_row};1H"]
+    for i, line in enumerate(lines):
+        if i:
+            out.append("\r\n\x1b[%d;1H" % (first_row + i))
+        out.append(line)
+        out.append("\x1b[K")          # wipe what the old row left behind
+    sys.stdout.write("".join(out))
+
+def _render_menu(typed="", scroll=0, fresh=True):
+    """Draw the whole startup screen once, then hand the caret to the prompt.
+
+    Plain output, one pass, and a single cursor move afterwards. Nothing is
+    ever repainted in place, so there is no cursor arithmetic to drift: the rows
+    between the prompt and the counters are counted from the block that was just
+    printed, which is known exactly.
+
+    The prompt is drawn BEFORE the counters so it reads top-down, and the caret
+    is then walked back up to it, which is why the user can type into a line that
+    has something under it.
+    """
+    # The width first: the bars are sized from it, so the block has to be built
+    # before the height is known.
+    w = _ensure_terminal_width(_logo_width() + 8)
+    have_counters = bool(_stats_lines(w))
     table = [
         ["[1] Start", f"[4] API Port: {PORT}", "[7] GitHub"],
         [f"[2] {_tick(CAPTCHA_BYPASS)} Captcha Bypass", "[5] Open accounts.json", "[8] Exit"],
@@ -2245,45 +2875,85 @@ def _render_menu():
     # offset (otherwise each row centers itself and the columns drift apart).
     block_w = max(_visible_len(r) for r in rows)
     left = max(0, (w - block_w) // 2)
-    for r in rows:
-        print(" " * left + r)
-    print()
+    # Build everything that is not stats first and count the rows it takes, so
+    # the stats block is cut against what is really left of the screen. Counting
+    # the parts separately is where this goes wrong: the option table is one
+    # string holding three lines, so a formula over the pieces is off by two.
+    body = list(_gradient_lines(LOGO.splitlines(), w))
+    body.append("")
+    body.append(chr(10).join(" " * left + r for r in rows))
+    body.append("")
+    prompt = f" Choice: {typed}"
+    body.append(prompt)
+    # Count the rows everything but stats takes, from the block that was really
+    # built - the option table is one string holding three lines, so a formula
+    # over the parts is off by two. The stats block gets whatever is left.
+    chrome_rows = sum(line.count(chr(10)) + 1 for line in body)
+    chrome_rows += 1              # the blank line that goes above the stats block
+    counters, max_scroll = _stats_viewport(w, scroll, chrome_rows)
+    if counters:
+        body.append("")
+    body.extend(counters)
+    prompt_row = sum(line.count(chr(10)) + 1 for line in body[:body.index(prompt)])
+    stats_row = body.index(counters[0]) if counters else -1
 
+    # A wheel step must not wipe the screen. The stats band is the only part that
+    # changes, and while it overflows its height does not change either, so it can
+    # be repainted in place between the prompt and the bottom of the screen.
+    if not fresh and counters and prompt_row >= 0 and stats_row >= 1:
+        rows = sum(line.count(chr(10)) + 1 for line in body[:stats_row])
+        _repaint_band(counters, rows + 1)
+        sys.stdout.write(f"[{prompt_row + 1};{len(prompt) + 1}H")
+        sys.stdout.flush()
+        return max_scroll
 
-def open_accounts_file():
-    """Open accounts.json in the default editor/app (works on win/mac/linux)."""
-    path = os.path.abspath(ACCOUNTS_FILE)
-    try:
-        if os.name == "nt":
-            os.startfile(path)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-        log(f"[menu] opened {path}")
-    except Exception as e:
-        log(f"[menu] could not open accounts.json: {e}", level="ERROR")
-
-
-GITHUB_URL = "https://github.com/lothiann/Free-ZAI-Api"
-
-
-def open_github():
-    """Open the GitHub repo in the default browser (works on win/mac/linux)."""
-    try:
-        webbrowser.open(GITHUB_URL)
-        log(f"[menu] opened {GITHUB_URL}")
-    except Exception as e:
-        log(f"[menu] could not open GitHub: {e}", level="ERROR")
+    _clear()
+    for line in body:
+        print(line)
+    # Walk the caret back to the end of the prompt so the input types into it.
+    # print() already moved the caret one row PAST the prompt line, so the rows to
+    # cross are that consumed row plus, when the counters are there, a blank line
+    # and every counter row. With no counters at all only the first applies. And
+    # CSI n A only changes the row: the column is still 0 after a newline, so
+    # without the trailing CSI n C the caret would sit before the prompt text and
+    # the first keystroke would land in front of it.
+    # How many rows sit between the prompt and the caret: everything printed
+    # below it, plus the row the final newline left the caret on. Counted from
+    # the block rather than from the counters, because the hint and the blank
+    # lines are rows too and hand-counting them is how this used to go wrong.
+    rows_below = sum(line.count(chr(10)) + 1 for line in body[body.index(prompt) + 1:])
+    crossed = rows_below + 1
+    sys.stdout.write(f"\x1b[{crossed}A\x1b[{len(prompt)}C")
+    sys.stdout.flush()
+    return max_scroll
 
 
 async def run_menu():
     """Interactive startup menu. Returns when the user picks [1] Start."""
     global PORT, HEADLESS, CAPTCHA_BYPASS, ACCOUNT_ROTATE
     while True:
-        _render_menu()
+        # How far the stats block can be scrolled. Zero when it fits, and then
+        # the mouse is left alone entirely: no reporting, no stolen clicks, and
+        # the terminal keeps its own text selection and wheel scrolling.
+        max_scroll = _render_menu()
+        scroll = 0
+
+        def on_scroll(delta, typed):
+            nonlocal scroll
+            moved = max(0, min(scroll + delta, max_scroll))
+            if moved != scroll:            # at an end there is nothing to redraw
+                scroll = moved
+                # only the stats band moves on a scroll, so the rest of the
+                # screen is left exactly where it is
+                _render_menu(typed, scroll, fresh=False)
+
         try:
-            choice = input(" Choice: ").strip()
+            # The mouse is only taken while the stats block has something to
+            # scroll: capturing it means turning Quick Edit off, and with that
+            # gone the user cannot select text in the terminal. A block that fits
+            # needs no wheel, so the mouse stays theirs.
+            choice = _read_line(_input_limit(), on_scroll=on_scroll,
+                                mouse=max_scroll > 0).strip()
         except (EOFError, KeyboardInterrupt):
             # Ctrl+C at the main prompt exits the program
             _clear()
