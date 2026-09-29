@@ -1,2 +1,3 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Text files are stored with LF in the repository and checked out as CRLF,
+# so the files on disk look the same on Windows and in a fresh checkout.
+* text=auto eol=crlf
