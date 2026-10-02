@@ -95,6 +95,48 @@ def log(msg, level="INFO"):
 
 # ===== JS SNIPPETS =====
 
+# A new chat is started on the page that is already loaded instead of a full
+# page.goto. chat.z.ai mints a fresh conversation per navigation, and the site's
+# own new-chat control / router does it just as well - without re-running the SPA
+# boot, the auth check and the asset load on every request.
+SPA_CHAT_REUSE = True
+# Reuse keeps the JS heap between requests (a reload is what recycled it).
+# Above this, take the reload deliberately rather than inherit a bloated page.
+SPA_HEAP_LIMIT_MB = 900
+
+# Client-side transition to a fresh chat, with a sentinel that proves the
+# document was NOT reloaded: a real page load wipes window, so a vanished
+# counter means we silently paid for a full boot anyway.
+NEW_CHAT_SPA_JS = """
+    () => {
+        window.__spaWarm = (window.__spaWarm || 0) + 1;
+        const token = window.__spaWarm;
+        const vis = (el) => !!el && !!(el.offsetWidth || el.offsetHeight);
+        const pick = (sel) => {
+            for (const el of document.querySelectorAll(sel)) {
+                const label = (el.getAttribute('aria-label') ||
+                               el.getAttribute('title') || '') + '';
+                if (!vis(el) || /stop|send|close|menu/i.test(label)) continue;
+                return el;
+            }
+            return null;
+        };
+        let clicked = false;
+        for (const sel of ['[data-testid="new-chat-button"]',
+                           'button[aria-label*="New chat" i]',
+                           'div[aria-label*="New chat" i]',
+                           '[data-testid="new-chat"]']) {
+            const el = pick(sel);
+            if (el) { el.click(); clicked = true; break; }
+        }
+        if (!clicked) {
+            history.pushState({}, '', '/');
+            window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+        }
+        return token;
+    }
+"""
+
 INIT_HOOK_JS = """
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
@@ -932,6 +974,9 @@ class ZaiSession:
         self.context = None
         self.lock = asyncio.Lock()
         self.token_queue = asyncio.Queue()
+        # False until a chat page is loaded and can be reused
+        self._warm = False
+        self._cdp = None
         self._models_cache = None
         self._models_cache_ts = 0
         self.last_activity = 0.0
@@ -972,6 +1017,7 @@ class ZaiSession:
         ready = await poll_js(self.page, MODEL_READY_JS, timeout_s=30)
         if not ready:
             raise RuntimeError(f"Account #{idx}: page never became ready")
+        self._warm = True
 
     async def is_captcha(self):
         """True if the Aliyun slider captcha is currently visible."""
@@ -1159,6 +1205,7 @@ class ZaiSession:
         # initial navigation
         await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
         await poll_js(self.page, MODEL_READY_JS, timeout_s=30)
+        self._warm = True
         log("Browser session ready")
 
     async def get_models(self):
@@ -1366,19 +1413,71 @@ class ZaiSession:
         await self.page.keyboard.press("Escape")
         return bool(clicked)
 
+    async def _heap_used_mb(self):
+        """JS heap in MB, or 0.0 when it cannot be read."""
+        try:
+            if self._cdp is None:
+                self._cdp = await self.context.new_cdp_session(self.page)
+            res = await self._cdp.send("Runtime.getHeapUsage")
+            return res.get("usedSize", 0) / (1024 * 1024)
+        except Exception:
+            return 0.0
+
+    async def _spa_new_chat(self):
+        """Start a fresh chat on the already-loaded page.
+
+        Returns False - leaving prepare_chat to do a real page.goto - whenever
+        the page cannot be trusted to still be warm: a reload behind our back
+        (sentinel gone), a heap worth recycling, or a page that did not settle.
+        """
+        if not SPA_CHAT_REUSE or not self._warm:
+            return False
+        used = await self._heap_used_mb()
+        if used > SPA_HEAP_LIMIT_MB:
+            log(f"[spa] heap {used:.0f}MB > {SPA_HEAP_LIMIT_MB}MB - full reload",
+                level="WARN")
+            self._warm = False
+            return False
+        try:
+            token = await self.page.evaluate(NEW_CHAT_SPA_JS)
+            if not token:
+                return False
+            await asyncio.sleep(0.3)
+            same = await self.page.evaluate("() => window.__spaWarm === %d" % token)
+        except Exception:
+            self._warm = False
+            return False
+        if not same:
+            log("[spa] new chat reloaded the page - full reload next time",
+                level="WARN")
+            self._warm = False
+            return False
+        if not await poll_js(self.page, MODEL_READY_JS, timeout_s=10):
+            self._warm = False
+            return False
+        return True
+
     async def prepare_chat(self, model_id):
-        """Fresh chat page with the given model selected."""
-        attempts = 3
-        for attempt in range(1, attempts + 1):
-            await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
-            ready = await poll_js(self.page, MODEL_READY_JS, timeout_s=30)
-            if not ready:
-                if attempt < attempts:
-                    log(f"[prepare] model selector not ready (attempt {attempt}/{attempts})", level="WARN")
-                    await asyncio.sleep(5)
-                    continue
-                raise RuntimeError("Model selector never appeared")
-            break
+        """Fresh chat page with the given model selected.
+
+        Normally the fresh chat is opened on the page that is already loaded -
+        the SPA transition is worth seconds on every request. The full goto stays
+        as the fallback for a cold page, a bloated heap, or a transition that
+        turns out to reload the document after all.
+        """
+        if not await self._spa_new_chat():
+            attempts = 3
+            for attempt in range(1, attempts + 1):
+                await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
+                ready = await poll_js(self.page, MODEL_READY_JS, timeout_s=30)
+                if not ready:
+                    if attempt < attempts:
+                        log(f"[prepare] model selector not ready (attempt {attempt}/{attempts})", level="WARN")
+                        await asyncio.sleep(5)
+                        continue
+                    raise RuntimeError("Model selector never appeared")
+                self._warm = True
+                break
         # make sure no popup blocks us
         await poll_js(self.page,
                       "() => !document.querySelector('[data-dialog-overlay], div._modal-overlay')",
