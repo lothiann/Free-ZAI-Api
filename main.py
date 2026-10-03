@@ -93,6 +93,22 @@ def log(msg, level="INFO"):
         f.write(line + "\n")
 
 
+# Tasks started from a generator that is being torn down (a client hangup).
+# asyncio keeps only a WEAK reference to a task, so a fire-and-forget one - the
+# kind created in a GeneratorExit handler - can be garbage-collected before it
+# ever runs a single step. That is why the "client disconnected" line kept
+# disappearing: the task was scheduled, then collected. Holding it in a set for
+# the duration is the whole fix.
+_bg_tasks = set()
+
+
+def _bg_spawn(coro):
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
 # ===== JS SNIPPETS =====
 
 # A new chat is started on the page that is already loaded instead of a full
@@ -104,37 +120,61 @@ SPA_CHAT_REUSE = True
 # Above this, take the reload deliberately rather than inherit a bloated page.
 SPA_HEAP_LIMIT_MB = 900
 
-# Client-side transition to a fresh chat, with a sentinel that proves the
-# document was NOT reloaded: a real page load wipes window, so a vanished
-# counter means we silently paid for a full boot anyway.
+# Start a fresh chat from the page that is already loaded, and prove the
+# document was NOT reloaded while doing it: a real page load wipes window, so a
+# vanished sentinel means we silently paid for a full boot anyway.
+#
+# The command is the site's own, read off its bundle rather than guessed: the
+# sidebar "New Chat" handler calls SvelteKit's private goto('/') and then
+# dispatches this event, which the chat store is subscribed to from the moment
+# the chat view mounts. Measured on a live page, the event clears the
+# conversation, the composer and location in one go; the document stays alive.
+#
+# What was tried before and why it was wrong: clicking a "New chat" control
+# (z.ai has no data-testid at all, and the only element carrying
+# aria-label="New Chat" is the mobile-only button, class "flex md:hidden", hidden
+# on the desktop), and rewriting the address by hand with history.replaceState +
+# a raw popstate. The last one was the dangerous kind of wrong: it moved the
+# address bar back to "/" so the sentinel survived and the transition "passed",
+# while the previous conversation stayed on screen with its turns still in the
+# context of every later request. SvelteKit keeps its own router state and does
+# not react to a synthesised popstate, which is why it looked like it worked.
 NEW_CHAT_SPA_JS = """
     () => {
         window.__spaWarm = (window.__spaWarm || 0) + 1;
         const token = window.__spaWarm;
-        const vis = (el) => !!el && !!(el.offsetWidth || el.offsetHeight);
-        const pick = (sel) => {
-            for (const el of document.querySelectorAll(sel)) {
-                const label = (el.getAttribute('aria-label') ||
-                               el.getAttribute('title') || '') + '';
-                if (!vis(el) || /stop|send|close|menu/i.test(label)) continue;
-                return el;
-            }
+        try {
+            window.dispatchEvent(new CustomEvent('switchNewChat'));
+        } catch (e) {
             return null;
-        };
-        let clicked = false;
-        for (const sel of ['[data-testid="new-chat-button"]',
-                           'button[aria-label*="New chat" i]',
-                           'div[aria-label*="New chat" i]',
-                           '[data-testid="new-chat"]']) {
-            const el = pick(sel);
-            if (el) { el.click(); clicked = true; break; }
-        }
-        if (!clicked) {
-            history.pushState({}, '', '/');
-            window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
         }
         return token;
     }
+"""
+
+# A fresh chat shows its empty state; a live conversation does not. Measured:
+# present on a fresh chat, absent once an answer rendered, back after the new
+# chat. The sentinel cannot tell those apart on its own - that gap is exactly how
+# a no-op transition passed for a real one - so the reset is verified here rather
+# than inferred from "the page did not reload".
+NEW_CHAT_BUTTON_JS = """
+    () => {
+        const vis = (el) => !!(el.offsetWidth || el.offsetHeight);
+        let btn = [...document.querySelectorAll('button, div[role="button"]')]
+            .find((b) => vis(b) &&
+                         /^\\s*new chat\\s*$/i.test(b.innerText || ''));
+        if (!btn) {
+            btn = [...document.querySelectorAll('[aria-label]')].find(
+                (b) => vis(b) &&
+                       /^\\s*new chat\\s*$/i.test(b.getAttribute('aria-label') || ''));
+        }
+        if (!btn) return false;
+        btn.click();
+        return true;
+    }
+"""
+FRESH_CHAT_JS = """
+    () => !!document.querySelector('[aria-label="What can I build for you?"]')
 """
 
 INIT_HOOK_JS = """
@@ -879,7 +919,15 @@ def _hide_windows_for_pids(pids):
 
 # ===== MEDIA (image / video attachments) =====
 
-MEDIA_UPLOAD_WAIT = 4.0        # seconds to let the site finish uploading
+# The site uploads asynchronously and never says so in the composer: after a
+# successful upload the attachment looks the same as one still in flight, and
+# there is no chip count or label to count on. So the wait is on the site's own
+# answer - POST to this path came back 200 in 0.78s on a measured 492-byte
+# upload, while the fixed sleep it replaced always cost 4s. These are a ceiling,
+# not a pause: a fast upload returns at once, a slow one is waited for instead of
+# being cut off, and a refusal ends the wait immediately.
+MEDIA_UPLOAD_TIMEOUT = 60.0    # ceiling for the site to accept the files
+MEDIA_UPLOAD_POLL_MS = 200
 # The composer's "+" button. It carries a stable id (unlike the hashed classes)
 # and opens a native file picker, so the files are handed over through a
 # filechooser event - filling the hidden <input type=file> directly does NOT
@@ -977,6 +1025,11 @@ class ZaiSession:
         # False until a chat page is loaded and can be reused
         self._warm = False
         self._cdp = None
+        self._net_wired = False
+        # uploads: how many files the site has accepted since the last reset,
+        # and which requestId to blame if one dies on the network
+        self._upload_ok = 0
+        self._upload_rid = None
         self._models_cache = None
         self._models_cache_ts = 0
         self.last_activity = 0.0
@@ -1413,6 +1466,67 @@ class ZaiSession:
         await self.page.keyboard.press("Escape")
         return bool(clicked)
 
+    async def _watch_uploads(self):
+        """Attach the network feed once, and report whether it is available.
+
+        Uploads are confirmed by the site's own answer rather than by anything
+        in the composer, so this is what makes "the file is there" knowable.
+        """
+        if self._net_wired:
+            return self._cdp is not None
+        self._net_wired = True
+        try:
+            if self._cdp is None:
+                self._cdp = await self.context.new_cdp_session(self.page)
+
+            def on_request(ev):
+                url = (ev.get("request") or {}).get("url") or ""
+                if "/api/v1/files/" in url:
+                    self._upload_rid = ev.get("requestId")
+
+            def on_response(ev):
+                resp = ev.get("response") or {}
+                status = resp.get("status") or 0
+                if "/api/v1/files/" not in (resp.get("url") or ""):
+                    return
+                if 200 <= status < 300:
+                    self._upload_ok += 1
+                else:
+                    # a refusal is an answer too - otherwise the wait sits out
+                    # the whole ceiling on a plain 500
+                    self._upload_ok = -1
+
+            def on_failed(ev):
+                if ev.get("requestId") == self._upload_rid:
+                    self._upload_ok = -1
+
+            self._cdp.on("Network.requestWillBeSent", on_request)
+            self._cdp.on("Network.responseReceived", on_response)
+            self._cdp.on("Network.loadingFailed", on_failed)
+            await self._cdp.send("Network.enable")
+            return True
+        except Exception as e:
+            log(f"[media] no network feed, uploads are timed blind: {e}",
+                level="WARN")
+            return False
+
+    async def _settle_uploads(self, count):
+        """Wait until the site has accepted `count` files. True when it has."""
+        if not await self._watch_uploads():
+            # no feed: give the upload a fixed grace period and move on
+            await asyncio.sleep(MEDIA_UPLOAD_TIMEOUT)
+            return True
+        deadline = time.time() + MEDIA_UPLOAD_TIMEOUT
+        while True:
+            if self._upload_ok >= count:
+                return True
+            if self._upload_ok < 0:
+                # the site answered and refused: no point waiting out the ceiling
+                return False
+            if time.time() >= deadline:
+                return False
+            await asyncio.sleep(MEDIA_UPLOAD_POLL_MS / 1000)
+
     async def _heap_used_mb(self):
         """JS heap in MB, or 0.0 when it cannot be read."""
         try:
@@ -1438,18 +1552,36 @@ class ZaiSession:
                 level="WARN")
             self._warm = False
             return False
-        try:
-            token = await self.page.evaluate(NEW_CHAT_SPA_JS)
-            if not token:
-                return False
-            await asyncio.sleep(0.3)
-            same = await self.page.evaluate("() => window.__spaWarm === %d" % token)
-        except Exception:
-            self._warm = False
-            return False
-        if not same:
-            log("[spa] new chat reloaded the page - full reload next time",
-                level="WARN")
+        fresh = False
+        for attempt in ("event", "button"):
+            try:
+                if attempt == "event":
+                    token = await self.page.evaluate(NEW_CHAT_SPA_JS)
+                    if not token:
+                        continue
+                    await asyncio.sleep(0.3)
+                    if not await self.page.evaluate(
+                            "() => window.__spaWarm === %d" % token):
+                        log("[spa] new chat reloaded the page - "
+                            "full reload next time", level="WARN")
+                        self._warm = False
+                        return False
+                else:
+                    # the event found no mounted listener: press the control that
+                    # dispatches it and check again before giving up
+                    log("[spa] switchNewChat unanswered - pressing New Chat",
+                        level="WARN")
+                    if not await self.page.evaluate(NEW_CHAT_BUTTON_JS):
+                        continue
+                    await asyncio.sleep(0.3)
+                if await poll_js(self.page, FRESH_CHAT_JS, timeout_s=5):
+                    fresh = True
+                    break
+            except Exception:
+                break
+        if not fresh:
+            log("[spa] new chat left the old conversation on screen - "
+                "full reload", level="WARN")
             self._warm = False
             return False
         if not await poll_js(self.page, MODEL_READY_JS, timeout_s=10):
@@ -1539,9 +1671,14 @@ class ZaiSession:
             async with self.page.expect_file_chooser(timeout=15000) as fc_info:
                 await btn.click()
             chooser = await fc_info.value
+            await self._watch_uploads()
+            self._upload_ok = 0
             await chooser.set_files(paths)
-            # the site uploads asynchronously
-            await asyncio.sleep(MEDIA_UPLOAD_WAIT)
+            # Wait for the site to confirm the files rather than for a fixed
+            # number of seconds: a small image is accepted in well under a second,
+            # and nothing in the composer shows when it has landed.
+            if not await self._settle_uploads(len(paths)):
+                raise RuntimeError("chat.z.ai did not accept the attachment")
         finally:
             for p_ in paths:
                 try:
@@ -1905,6 +2042,10 @@ async def chat_completions(request: Request):
         # Each /v1/chat/completions stream runs on its OWN worker (its own
         # browser/context/page), so multiple requests can generate in parallel.
         wk = await pool.acquire()
+        # Set when the client hangs up: the worker is then handed back by the
+        # stop task, not by the finally below, so it cannot be reused while the
+        # Stop button is still being clicked.
+        stopped_by_disconnect = False
         try:
             try:
                 await wk.rate_limit()
@@ -2074,17 +2215,6 @@ async def chat_completions(request: Request):
                     "usage": usage_out,
                 })
                 yield "data: [DONE]\n\n"
-            except (asyncio.CancelledError, GeneratorExit):
-                # Client went away mid-stream -> stop generation on the site.
-                # NOTE: awaiting anything here is pointless - the generator is
-                # being finalized and won't resume. So the click AND its log
-                # live in an independent task that survives the teardown.
-                async def _stop_and_log():
-                    stopped = await wk.stop_generation()
-                    log(f"[stream] client disconnected -> stop button "
-                        f"{'clicked' if stopped else 'NOT found'}")
-                asyncio.create_task(_stop_and_log())
-                raise
             finally:
                 log(f"--> done: reasoning={sum(len(x) for x in full_reasoning)}ch "
                     f"answer={sum(len(x) for x in full_answer)}ch "
@@ -2095,8 +2225,31 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
                 with open("last_response.json", "w", encoding="utf-8") as f:
                     json.dump({"reasoning": "".join(full_reasoning), "answer": "".join(full_answer)},
                               f, ensure_ascii=False, indent=2)
+        except (asyncio.CancelledError, GeneratorExit):
+            stopped_by_disconnect = True
+            # Client went away mid-stream -> stop generation on the site.
+            #
+            # This handler wraps the WHOLE request on purpose. It used to sit
+            # around the final chunk block only, so a hangup during generation
+            # raised GeneratorExit at the yield inside the stream loop and was
+            # never seen: nothing was clicked and nothing was logged. The click
+            # goes into a task because a generator being torn down cannot await
+            # here, and _bg_spawn keeps that task referenced so it is not
+            # collected before it runs.
+            async def _stop_and_log():
+                try:
+                    stopped = await wk.stop_generation()
+                    log(f"[stream] client disconnected -> stop button "
+                        f"{'clicked' if stopped else 'NOT found'}")
+                finally:
+                    # The worker is handed back only after the stop is done, so
+                    # it cannot be reused by another request mid-click.
+                    pool.release(wk)
+            _bg_spawn(_stop_and_log())
+            raise
         finally:
-            pool.release(wk)
+            if not stopped_by_disconnect:
+                pool.release(wk)
 
     if stream:
         return StreamingResponse(generate(), media_type="text/event-stream")
@@ -2240,9 +2393,45 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
     }
 
 
+_update_available = None
+
+
+def _check_for_update():
+    """Compare the local HEAD with the remote's, once, off the menu thread."""
+    global _update_available
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        local = subprocess.check_output(
+            ["git", "-C", repo_dir, "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        remote_out = subprocess.check_output(
+            ["git", "-C", repo_dir, "ls-remote", "origin", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+    except Exception:
+        return                      # not a git checkout, or no network / origin
+    remote = remote_out.split()[0] if remote_out else ""
+    if local and remote and remote != local:
+        _update_available = (local[:7], remote[:7])
+
+
 async def main():
+    _enable_ansi()
+    _set_terminal_title("Free-ZAI-API")
+    # Kick the update check off immediately, but say nothing yet: the menu must
+    # not be interrupted. The verdict is only printed once Start is chosen.
+    update_task = _bg_spawn(asyncio.to_thread(_check_for_update))
     pool.start_hider()   # keep worker windows hidden (Windows only, HEADLESS on)
     await run_menu()
+    # The check has had the whole time the menu was up; wait a little longer in
+    # case Start was pressed straight away, then report.
+    try:
+        await asyncio.wait_for(asyncio.shield(update_task), timeout=5)
+    except Exception:
+        pass
+    if _update_available:
+        log(f"[update] new version available: {_update_available[0]} -> "
+            f"{_update_available[1]}")
+        log("[update] update with: git pull")
     # No global browser here: the pool spawns one browser per active
     # request on demand (see WorkerPool.acquire).
     log(f"Starting OpenAI-compatible server on http://{HOST}:{PORT}/v1")
@@ -2276,6 +2465,15 @@ def _enable_ansi():
             kernel32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
         except Exception:
             pass
+
+
+def _set_terminal_title(title):
+    """Set the terminal/tab title (OSC 0). Ignored where unsupported."""
+    try:
+        sys.stdout.write(f"\x1b]0;{title}\x07")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def _clear():
@@ -2347,6 +2545,26 @@ def _ensure_terminal_width(min_w=None):
     while time.time() < deadline and _term_width() < min_w:
         time.sleep(0.02)
     grown = _term_width()
+    if grown >= min_w:
+        # The width query answers from the moment the console ACCEPTED the
+        # resize, not from the moment the screen has repainted at it. Drawing
+        # the first frame inside that window is the launch race: the banner is
+        # laid out for a grid the terminal is not showing yet, so it wraps and
+        # the caret walk counts the wrong rows. Wait for the width to hold
+        # still - still not a fixed pause - before handing it to the layout:
+        # two reads in a row that agree mean it has landed.
+        settle = time.time() + 0.5
+        stable = 0
+        while time.time() < settle:
+            time.sleep(0.02)
+            now = _term_width()
+            if now == grown:
+                stable += 1
+                if stable >= 2:
+                    break
+            else:
+                stable = 0
+                grown = now
     if grown < min_w:
         # Keep _LAST_AUTO_WIDTH set so we do not spam a terminal that will
         # never grow. It resets to 0 as soon as the width is enough, so a
@@ -2584,6 +2802,22 @@ def _stats_lines(width):
             return f"{share:.2f}"
         return "<0.01"
 
+    def row_share(name, value):
+        whole = chars_total if name == "Characters" else token_total
+        return (value * 100 / whole) if whole else 0.0
+
+    # The percentage column sizes itself the same way the number column does:
+    # "<0.01" is five characters while "93" is two, so a fixed rjust(4) lets the
+    # one wide value shove its bar right and break the column. Measure every
+    # percentage that will actually be printed and pad to the widest.
+    pct_w = max(
+        (len(pct_text(row_share(name, value)))
+         for group, _ in GROUP_TITLES
+         for name, value in per_group[group]
+         if value),
+        default=4,
+    )
+
     def block(title, values, is_total):
         lines = [f"  {title}:"]
         for name, value in values:
@@ -2594,9 +2828,8 @@ def _stats_lines(width):
             if is_total:
                 lines.append(f"{head} | {_bar(1.0, room_for(head, width))} |")
                 continue
-            whole = chars_total if name == "Characters" else token_total
-            share = (value * 100 / whole) if whole else 0.0
-            head += f" | {pct_text(share).rjust(4)}%"
+            share = row_share(name, value)
+            head += f" | {pct_text(share).rjust(pct_w)}%"
             # The bar is sized from the row that is actually being built, so the
             # line can never reach the terminal width. room_for() has to see the
             # percentage too: measuring the head before the "|  93%" is appended
