@@ -2047,6 +2047,11 @@ async def chat_completions(request: Request):
         # Stop button is still being clicked.
         stopped_by_disconnect = False
         try:
+            if await request.is_disconnected():
+                # Client hung up while the browser was still starting. Nothing
+                # has gone on the wire, so skip prepare and the prompt; the
+                # finally below hands the worker back like any finished request.
+                return
             try:
                 await wk.rate_limit()
                 acc = await wk.before_request()
@@ -2063,6 +2068,12 @@ async def chat_completions(request: Request):
             # started a retry would duplicate tokens, so we stop retrying then.
             retries = 0
             while True:
+                if await request.is_disconnected():
+                    # The client hung up before this attempt put anything on the
+                    # wire: nothing to generate, nothing to stop, and the prompt
+                    # must not be sent. Returning lets the finally below release
+                    # the worker.
+                    return
                 full_reasoning = []
                 full_answer = []
                 tool_buf = ToolStreamBuffer() if has_tools else None
