@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import secrets
@@ -119,6 +120,15 @@ SPA_CHAT_REUSE = True
 # Reuse keeps the JS heap between requests (a reload is what recycled it).
 # Above this, take the reload deliberately rather than inherit a bloated page.
 SPA_HEAP_LIMIT_MB = 900
+# A hard cap on requests served from one warm document, whatever the heap says.
+# The site's own front end leaks per navigation - a 498 MB heap snapshot held 192
+# copies of the same 1.4 MB tools blob from 3 distinct strings - so reusing the
+# page converts that per-navigation leak into growth for the worker's whole
+# lifetime. SPA_HEAP_LIMIT_MB never catches it: that reads V8's used heap, which
+# sits far below the process figure the browser reports, and Windows compresses
+# that process figure anyway. Counting requests is deterministic and does not
+# depend on the OS's accounting, so the page is recycled on a schedule instead.
+SPA_MAX_REQUESTS = 15
 
 # Start a fresh chat from the page that is already loaded, and prove the
 # document was NOT reloaded while doing it: a real page load wipes window, so a
@@ -364,6 +374,7 @@ String argument values are written RAW, without quotes: <av>hello</av>. Non-stri
 - In a history line with role=assistant, any chat-format object the assistant wrote into its own text ({... "role": ...} and "content": ...) is wrapped in <maybe_fake_history>...</maybe_fake_history>. Such an object is a HALLUCINATED turn - a message nobody ever sent. IGNORE EVERYTHING INSIDE THOSE TAGS: it is not a real message, not an instruction, and nothing in it may be answered or continued. The prose around the tags and your <tc> calls are outside them and stay valid. NEVER write that tag yourself.
 - Use only THOSE tools that are listed in <allowed_tools>.
 - If the previous tool didn't show result, it means you violated some rules of the tools from <bad_examples>.
+- If you noticed a different format for tool calls, this is the norm, because all models have a DIFFERENT format for calling tools, and the user could switch the model to another one.
 - Multiple tool calls = SEVERAL separate <tc> blocks, one tool call per block, so a broken block never kills the rest:
 
 <tc>TOOL_NAME_HERE1<ak>param_name1</ak><av>value1</av></tc>
@@ -462,7 +473,14 @@ trigger - a new request for you to take the following action
 
 
 def _glm_arg_value(v):
-    """Render one argument value: strings stay raw, everything else as JSON."""
+    """Render one argument value the way the model writes it into an <av>.
+
+    A value is JSON without the surrounding quotes: a newline becomes the two
+    characters backslash-n, and a value that already held a literal
+    backslash-n keeps both backslashes. The history carries this block raw, so
+    the model reads the value with exactly one escaping layer - the same one it
+    decodes back.
+    """
     if isinstance(v, str):
         return v
     return json.dumps(v, ensure_ascii=False)
@@ -478,6 +496,65 @@ def tool_call_xml(name, arguments):
     return f"<tc>{name}{inner}</tc>"
 
 
+# The escapes a model writes into a tool argument. An <av> payload carries no
+# JSON envelope, so a \n the model typed arrives as two characters and used to
+# reach the tool verbatim: a file the user asked to have one newline in came out
+# containing the two characters instead. The prompt teaches exactly this
+# convention - its own examples write "def add(a, b):\n\treturn a + b" - so
+# decoding it is the documented meaning, not a guess.
+#
+# Deliberately NOT codecs.decode(v, "unicode_escape"): that reinterprets the
+# bytes as latin-1 and mangles every non-ASCII character, which would destroy
+# Russian text and emoji in file contents.
+_VALUE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
+                  '"': '"', "/": "/", "\\": "\\"}
+_HEX = "0123456789abcdefABCDEF"
+
+
+def _unescape_value(v):
+    """Decode the escape sequences a model writes into a tool argument.
+
+    One left-to-right pass, so \\\\n collapses to a single backslash followed by
+    an n instead of turning into a newline, and an escape this table does not
+    know (\\d, \\w, \\1 in a regex) keeps its backslash.
+    """
+    if "\\" not in v:
+        return v
+    out = []
+    i = 0
+    n = len(v)
+    while i < n:
+        c = v[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = v[i + 1]
+        if nxt == "u" and i + 6 <= n and all(ch in _HEX for ch in v[i + 2:i + 6]):
+            cp = int(v[i + 2:i + 6], 16)
+            i += 6
+            # JSON writes an astral character as a surrogate PAIR of two \u
+            # escapes. Decoding each half on its own yields two unpaired code
+            # units - an emoji came out as 0xd83d 0xde00 instead of one
+            # character - so the halves have to be joined, exactly as json.loads
+            # does it.
+            if (0xD800 <= cp <= 0xDBFF and v[i:i + 2] == "\\u" and i + 6 <= n
+                    and all(ch in _HEX for ch in v[i + 2:i + 6])):
+                low = int(v[i + 2:i + 6], 16)
+                if 0xDC00 <= low <= 0xDFFF:
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                    i += 6
+            out.append(chr(cp))
+            continue
+        if nxt in _VALUE_ESCAPES:
+            out.append(_VALUE_ESCAPES[nxt])
+            i += 2
+            continue
+        out.append(c)                       # unknown escape: keep the backslash
+        i += 1
+    return "".join(out)
+
+
 def _unquote_val(v):
     """Turn one <av> payload into the value the tool should actually receive.
 
@@ -485,24 +562,34 @@ def _unquote_val(v):
     <av>{"a": 1}</av>       -> {"a": 1}       (container -> parsed object)
     <av>[1, 2]</av>         -> [1, 2]         (container -> parsed list)
     <av>ls -la</av>         -> 'ls -la'       (plain text -> string)
+    <av>test\ntest</av>     -> 'test<NL>test' (escapes decoded)
 
     The prompt tells the model that non-string values are written as JSON, but
     <ak>/<av> carry no type marker, so the type has to be read off the payload.
     Without this every object and list reached the tool as a quoted string.
 
-    Only containers are decoded: a bare number, true or null is far more often
-    meant as the string "42" than as the number 42 (ids, ports, versions), and
-    silently retyping those breaks the tool more often than it fixes it.
+    Numbers, booleans and null decode too, not just containers: the history
+    re-injection renders non-string arguments with json.dumps exactly the way
+    chat_template.jinja's "v | tojson if v is not string" does, so the value
+    the model writes bare for an "offset" must reach the tool as the number
+    1140 - as a string it fails the tool's own schema ("Expected number").
+    Something that is not valid JSON (007, 1.2.3) still stays a string.
     """
     v = v.strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
-        return v[1:-1].strip()
+        return _unescape_value(v[1:-1].strip())
     if v[:1] in ("{", "["):
+        try:
+            return json.loads(v)           # a real JSON value decodes its own escapes
+        except ValueError:
+            return _unescape_value(v)      # malformed container -> keep the text, decoded
+    # Bare JSON scalars: number, true, false, null.
+    if v[0:1].isdigit() or v[0:1] in ("-", "+", ".") or v in ("true", "false", "null"):
         try:
             return json.loads(v)
         except ValueError:
-            return v          # malformed container -> keep the raw text
-    return v
+            pass                           # not valid JSON (007, 1.2.3) -> string
+    return _unescape_value(v)
 
 
 def _parse_xml_call(inner):
@@ -576,9 +663,13 @@ def _strip_cdata(v):
 
 
 def render_tools_block(tools):
-    """Render the tool list literally as OpenAI-API style JSON: a {"tools": [...]}
-    array, each entry a {"type": "function", "function": {...}} object."""
-    return json.dumps({"tools": tools}, ensure_ascii=False, indent=2)
+    """Render the tool list as one compact OpenAI-API style JSON line: a
+    {"tools": [...]} array, each entry a {"type": "function", "function": {...}}
+    object. Compact (no indent) so the schemas sit on a single line: the model
+    must not see raw line breaks inside client-sent data, and any control
+    character in it stays escaped by json.dumps - the same escaping the
+    tool-call arguments use."""
+    return _unescape_value(json.dumps({"tools": tools}, ensure_ascii=False))
 
 
 def normalize_tool_tags(text):
@@ -951,6 +1042,28 @@ _EXT_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
                "image/bmp": ".bmp", "image/gif": ".gif",
                "image/svg+xml": ".svg", "video/mp4": ".mp4"}
 
+
+def _src_ext(src):
+    """The file suffix for an attachment source: from the mime for a data:
+    URL, from the name for a path or link, and .png when neither is knowable."""
+    if src.startswith("data:"):
+        mime = (src[5:].split(";")[0] or "").strip().lower()
+        return _EXT_SUFFIX.get(mime, ".png")
+    return os.path.splitext(src.split("?")[0])[1].lower() or ".png"
+
+
+def _upload_name(src):
+    """The name a file is uploaded under, derived from its source alone.
+
+    The history marker is built before the upload runs, so a random tempfile
+    name could never be reported there. Deriving it from the source instead
+    means the name the site receives and the name the transcript shows are the
+    same without any shared state between the two passes.
+    """
+    tok = hashlib.md5(src.encode("utf-8", "replace")).hexdigest()[:8]
+    return "zaiimg" + tok + _src_ext(src)
+
+
 def collect_media_parts(messages):
     """Pull image and video parts out of OpenAI-style messages.
 
@@ -990,7 +1103,8 @@ def collect_media_parts(messages):
                     head, _, b64 = url.partition(",")
                     mime = (head[5:].split(";")[0] or "").strip().lower()
                     if mime in IMAGE_MIMES + VIDEO_MIMES:
-                        out.append({"data": base64.b64decode(b64), "mime": mime})
+                        out.append({"data": base64.b64decode(b64), "mime": mime,
+                                    "src": url, "name": _upload_name(url)})
                 elif url.startswith(("http://", "https://")):
                     with urllib.request.urlopen(url, timeout=60) as r:
                         blob = r.read()
@@ -999,7 +1113,8 @@ def collect_media_parts(messages):
                         ext = os.path.splitext(url.split("?")[0])[1].lstrip(".").lower()
                         mime = _EXT_MIME.get(ext, "")
                     if mime in IMAGE_MIMES + VIDEO_MIMES:
-                        out.append({"data": blob, "mime": mime})
+                        out.append({"data": blob, "mime": mime,
+                                    "src": url, "name": _upload_name(url)})
                     else:
                         log(f"[media] skipped unsupported type "
                             f"{mime or '?'}: {url[:70]}", level="WARN")
@@ -1007,10 +1122,137 @@ def collect_media_parts(messages):
                     with open(url, "rb") as fh:
                         blob = fh.read()
                     ext = os.path.splitext(url)[1].lstrip(".").lower()
-                    out.append({"data": blob, "mime": _EXT_MIME.get(ext, "image/png")})
+                    out.append({"data": blob, "mime": _EXT_MIME.get(ext, "image/png"),
+                                "src": url, "name": _upload_name(url)})
             except Exception as e:
                 log(f"[media] skipped part ({e})", level="WARN")
     return out
+
+
+# The OpenAI content-part types this site is actually sent media under. The
+# marker below reuses the same type names, so a history line with a picture in
+# it is shaped exactly like the request that carried the picture. "file" is
+# here too, but only ever marked when its mime is media - see _media_marker.
+# input_audio is NOT: neither collect_media_parts nor _attach_media ever sends
+# audio to the site, so claiming one in the history would be a lie.
+_MEDIA_PART_TYPES = ("image_url", "video_url", "input_image", "input_video", "file")
+
+
+def _content_str(c):
+    """The text of one message, with the media parts dropped.
+
+    Module level, not a local of build_prompt: _history_content needs it too,
+    and a helper that only exists inside the one function that uses it cannot be
+    reused or tested on its own.
+    """
+    if isinstance(c, list):
+        return "\n".join(
+            x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"
+        )
+    if isinstance(c, str):
+        return c
+    return json.dumps(c, ensure_ascii=False)
+
+
+def _media_marker(part, kind):
+    """The history marker for one attachment.
+
+    {"type", "name"} always - name being the exact name the file is uploaded
+    under - plus "url" when the picture arrived as a link, or "path" when it
+    came from a local file, never both. Returns None for a part this project
+    never uploads - a "file" part holding a PDF, say - so the history can never
+    claim a file the site did not get. A data: URL has no source outside the
+    request itself, so it carries the name alone.
+    """
+    holder = part.get(kind)
+    if isinstance(holder, str):
+        src = holder
+    elif isinstance(holder, dict):
+        src = (holder.get("url") or holder.get("file_data")
+               or holder.get("path") or holder.get("file_id") or "")
+    else:
+        src = ""
+    if not isinstance(src, str) or not src:
+        return None
+
+    if kind == "file":
+        # collect_media_parts only uploads a "file" part when its mime is media,
+        # so a PDF has to stay out of the transcript entirely
+        if src.startswith("data:"):
+            mime = (src[5:].split(";")[0] or "").strip().lower()
+        else:
+            ext = os.path.splitext(src.split("?")[0])[1].lstrip(".").lower()
+            mime = _EXT_MIME.get(ext, "")
+        if mime not in IMAGE_MIMES + VIDEO_MIMES:
+            return None
+
+    marker = {"type": kind, "name": _upload_name(src)}
+    if src.startswith("data:"):
+        return marker
+    if src.startswith(("http://", "https://")):
+        marker["url"] = src
+    else:
+        marker["path"] = src
+    return marker
+
+
+def _history_content(c):
+    """One message's content for a history line.
+
+    Returns an OpenAI-shaped LIST when the message carried an attachment, with
+    the media part left in the position it was sent between the text parts, and
+    the plain flattened string when it did not.
+
+    Keeping the part in place is the whole point. The upload already went to the
+    site through collect_media_parts, but the transcript is what the model reads
+    on every later turn, and a line that joins only the text parts leaves it
+    unable to tell that there was a picture there at all, let alone which
+    sentence it belonged to.
+    """
+    if not isinstance(c, list):
+        return _content_str(c)
+    if not any(isinstance(p, dict) and p.get("type") in _MEDIA_PART_TYPES
+               for p in c):
+        return _content_str(c)
+    out = []
+    for p in c:
+        if not isinstance(p, dict):
+            continue
+        kind = p.get("type")
+        if kind in _MEDIA_PART_TYPES:
+            marker = _media_marker(p, kind)
+            if marker is None:
+                continue                     # never uploaded -> never claimed
+            out.append(marker)
+        elif kind == "text":
+            out.append({"type": "text", "text": p.get("text", "")})
+    return out or _content_str(c)
+
+
+def _tool_history_content(raw):
+    """A tool result for the history line, in OpenAI shape when it carried a file.
+
+    <tool_response> is ours, not OpenAI's, and the prompt describes the result
+    as a string wrapped in it - so the tag goes around the TEXT parts while the
+    media parts stay real parts beside them. Open the tag on the first text
+    part and close it on the last, which keeps the text/file interleaving the
+    caller sent, and the shape the model is told to expect.
+    """
+    content = _history_content(raw)
+    if isinstance(content, str):
+        return f"<tool_response>{content}</tool_response>"
+    text_at = [i for i, p in enumerate(content) if p.get("type") == "text"]
+    if not text_at:
+        return content
+    first, last = text_at[0], text_at[-1]
+    for i in text_at:
+        t = content[i]["text"]
+        if i == first:
+            t = "<tool_response>" + t
+        if i == last:
+            t = t + "</tool_response>"
+        content[i]["text"] = t
+    return content
 
 
 class ZaiSession:
@@ -1024,6 +1266,8 @@ class ZaiSession:
         self.token_queue = asyncio.Queue()
         # False until a chat page is loaded and can be reused
         self._warm = False
+        # requests served from the current warm document, reset on every reload
+        self._spa_served = 0
         self._cdp = None
         self._net_wired = False
         # uploads: how many files the site has accepted since the last reset,
@@ -1282,141 +1526,7 @@ class ZaiSession:
         self._models_cache_ts = time.time()
         return models
 
-    def build_prompt(self, messages, tools=None):
-        """History is rendered as OpenAI-style JSONL with native GLM XML tool
-        calls (<tc>NAME<ak>...</ak><av>...</av></tc>
-        — same shape the model must emit), results keyed by tool name and
-        wrapped in <tool_response>...</tool_response>, no ids anywhere."""
-        last_user = ""
-        call_label_by_id = {}
-
-        # pass 1: id -> display label ("name", repeats get "name #2")
-        for m in messages:
-            tcs = m.get("tool_calls") or []
-            if not tcs:
-                continue
-            counts = {}
-            for tc in tcs:
-                name = (tc.get("function") or {}).get("name", "unknown")
-                counts[name] = counts.get(name, 0) + 1
-                label = name if counts[name] == 1 else f"{name} #{counts[name]}"
-                cid = tc.get("id")
-                if cid:
-                    call_label_by_id[cid] = label
-
-        def _content_str(c):
-            if isinstance(c, list):
-                return "\n".join(
-                    x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"
-                )
-            if isinstance(c, str):
-                return c
-            return json.dumps(c, ensure_ascii=False)
-
-        def _reasoning_str(m):
-            """opencode sends assistant reasoning back as content parts
-            {"type": "reasoning", "text": ...} (or a reasoning_content field)."""
-            c = m.get("content")
-            if isinstance(c, list):
-                parts = [x.get("text", "") for x in c
-                         if isinstance(x, dict) and x.get("type") == "reasoning"]
-                return "\n".join(p for p in parts if p)
-            rc = m.get("reasoning_content") or m.get("reasoning")
-            return str(rc) if rc else ""
-
-        hist_lines = []
-        for m in messages:
-            role = m.get("role")
-            content = _content_str(m.get("content", ""))
-            if role == "system":
-                line = {"role": "system", "content": content}
-            elif role == "user":
-                last_user = content
-                line = {"role": "user", "content": content}
-            elif role == "assistant":
-                reasoning = _reasoning_str(m)
-                calls = []
-                for tc in m.get("tool_calls") or []:
-                    fn = tc.get("function") or {}
-                    raw_args = fn.get("arguments", {})
-                    if isinstance(raw_args, str):
-                        try:
-                            args = json.loads(raw_args)
-                        except json.JSONDecodeError:
-                            args = {"_raw": str(raw_args)}
-                    else:
-                        args = raw_args or {}
-                    calls.append({"name": fn.get("name", "unknown"), "arguments": args})
-                # Tool calls are folded into the SAME content field as native
-                # GLM <tc> XML blocks at the end (the shape the model
-                # itself must emit), instead of a separate tool_calls key.
-                # Each chat-format line the assistant wrote into its own text is
-                # a hallucinated turn, not a real message: tag every such JSON
-                # object. The prose around them and the <tc> calls stay outside.
-                content = re.sub(
-                    r'\{[^{}]*\\?"role\\?"\s*:[^{}]*\}',
-                    lambda m: f"<maybe_fake_history>{m.group(0)}</maybe_fake_history>",
-                    content)
-                if calls:
-                    tc_text = "\n".join(
-                        tool_call_xml(c["name"], c.get("arguments") or {}) for c in calls
-                    )
-                    content = f"{content}\n{tc_text}" if content else tc_text
-                line = {"role": "assistant", "content": content or ""}
-                if reasoning:
-                    line["thinking"] = reasoning
-            elif role == "tool":
-                label = call_label_by_id.get(m.get("tool_call_id"), "unknown")
-                line = {"role": "tool", "name": label,
-                        "content": f"<tool_response>{content}</tool_response>"}
-            else:
-                continue
-            hist_lines.append(line)
-
-        # The first system message (if any) becomes the "[System instructions]"
-        # block and is placed right after the History header below.
-        system_instr = None
-        if hist_lines and hist_lines[0]["role"] == "system":
-            system_instr = hist_lines.pop(0)["content"]
-
-        parts = []
-        tool_names = []
-
-        # 1. tool block first (if tools)
-        if tools:
-            tool_names = [t.get("function", {}).get("name", "?") for t in tools]
-            details = render_tools_block(tools)
-            parts.append(TOOL_PROMPT_TEMPLATE.format(tool_details=details, instructions=TOOL_INSTRUCTIONS))
-        # 2. Allowed tools (only if tools)
-        if tools:
-            parts.append("<allowed_tools>\n Allowed tools: " + ", ".join(tool_names) + "\n</allowed_tools>")
-        # 3. History header
-        parts.append("# History (oldest first), each line is one message:")
-        # [System instructions] directly after the history header, as a proper
-        # role=system message line
-        if system_instr:
-            parts.append(json.dumps({"role": "system", "content": system_instr}, ensure_ascii=False))
-        # 4. FINAL_SYSTEM_MESSAGE as a separate line (only if tools)
-        if tools:
-            final_line = json.dumps({"role": "system", "content": FINAL_SYSTEM_MESSAGE}, ensure_ascii=False)
-            # The convo text is pasted verbatim into the site's input, so the
-            # model reads the JSONL escapes literally (\\n shows as two
-            # backslashes). Collapse one layer so \\n / \\" in the source
-            # reach the model as the intended single backslash.
-            final_line = final_line.replace("\\\\", "\\").replace("\\\\\"", "\\\"")
-            parts.append(final_line)
-        # 5. Each history line as JSONL
-        parts.extend(json.dumps(h, ensure_ascii=False) for h in hist_lines)
-
-        convo = "\n\n".join(parts)
-
-        return (
-            f"{convo}\n\n"
-            f"---\n"
-            f"{SYSTEM_CONTINUE}\n"
-            f"Assistant's reply (ONLY content):"
-        ), last_user
-
+       
     @staticmethod
     def map_thinking(effort):
         """OpenAI reasoning_effort -> site Deep Think level."""
@@ -1546,6 +1656,14 @@ class ZaiSession:
         """
         if not SPA_CHAT_REUSE or not self._warm:
             return False
+        if self._spa_served >= SPA_MAX_REQUESTS:
+            # The budget is spent, so the document goes - not because anything
+            # measurable crossed a line, but because the site's per-navigation
+            # leak only ever gets collected when the document does.
+            log(f"[spa] {self._spa_served} requests on this page - full reload",
+                level="WARN")
+            self._warm = False
+            return False
         used = await self._heap_used_mb()
         if used > SPA_HEAP_LIMIT_MB:
             log(f"[spa] heap {used:.0f}MB > {SPA_HEAP_LIMIT_MB}MB - full reload",
@@ -1597,7 +1715,12 @@ class ZaiSession:
         as the fallback for a cold page, a bloated heap, or a transition that
         turns out to reload the document after all.
         """
-        if not await self._spa_new_chat():
+        if await self._spa_new_chat():
+            # counted here, where the choice is actually made: a request served
+            # from the warm page is one the next reload has to pay for
+            self._spa_served += 1
+        else:
+            self._spa_served = 0
             attempts = 3
             for attempt in range(1, attempts + 1):
                 await self.page.goto('https://chat.z.ai/', wait_until='domcontentloaded', timeout=60000)
@@ -1653,15 +1776,18 @@ class ZaiSession:
                 f"{MEDIA_MAX_FILES}, dropping the rest", level="WARN")
             images = images[:MEDIA_MAX_FILES]
         paths = []
+        # One private directory per attach: every file keeps the exact name the
+        # transcript marker reports, and two requests carrying the same picture
+        # cannot collide in the shared temp directory while they upload.
+        tmpdir = tempfile.mkdtemp(prefix="zaiimg_")
         try:
             for blob in images:
                 if len(blob["data"]) > MEDIA_MAX_BYTES:
                     log(f"[media] {blob.get('mime')} is over the site's 50 MB "
                         f"limit, dropped", level="WARN")
                     continue
-                fd, path = tempfile.mkstemp(prefix="zaiimg", suffix=_EXT_SUFFIX.get(
-                    blob.get("mime", ""), ".png"))
-                with os.fdopen(fd, "wb") as fh:
+                path = os.path.join(tmpdir, blob["name"])
+                with open(path, "wb") as fh:
                     fh.write(blob["data"])
                 paths.append(path)
             if not paths:
@@ -1685,6 +1811,10 @@ class ZaiSession:
                     os.unlink(p_)
                 except OSError:
                     pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
 
     async def send_message(self, prompt, media=None):
         # drain stale tokens
@@ -1762,6 +1892,169 @@ class ZaiSession:
             return bool(await self.page.evaluate(js))
         except Exception:
             return False
+
+
+
+    @staticmethod
+    def _reasoning_str(m):
+        """opencode sends assistant reasoning back as content parts
+        {"type": "reasoning", "text": ...} (or a reasoning_content field)."""
+        c = m.get("content")
+        if isinstance(c, list):
+            parts = [x.get("text", "") for x in c
+                     if isinstance(x, dict) and x.get("type") == "reasoning"]
+            return "\n".join(p for p in parts if p)
+        rc = m.get("reasoning_content") or m.get("reasoning")
+        return str(rc) if rc else ""
+
+    @staticmethod
+    def _serialize_history_obj(obj):
+        """Serialize a history dict to human-readable JSON-like format.
+        String values keep real newlines; backslashes and quotes are escaped.
+        Non-string values use json.dumps.
+        """
+        import json
+        parts = []
+        for k, v in obj.items():
+            if isinstance(v, str):
+                val = v.replace('"', '\\"')
+                parts.append('"{k}": "{val}"'.format(k=k, val=val))
+            else:
+                parts.append('"{k}": {v}'.format(k=k, v=json.dumps(v, ensure_ascii=False)))
+        return "{" + ", ".join(parts) + "}"
+
+    def build_prompt(self, messages, tools=None):
+        last_user = ""
+        call_label_by_id = {}
+
+        # pass 1: id -> display label ("name", repeats get "name #2")
+        for m in messages:
+            tcs = m.get("tool_calls") or []
+            if not tcs:
+                continue
+            counts = {}
+            for tc in tcs:
+                fn = tc.get("function") or {}
+                name = fn.get("name", "unknown")
+                counts[name] = counts.get(name, 0) + 1
+                label = name if counts[name] == 1 else "{name} #{count}".format(name=name, count=counts[name])
+                cid = tc.get("id")
+                if cid:
+                    call_label_by_id[cid] = label
+
+        hist_lines = []
+        for m in messages:
+            role = m.get("role")
+            raw = m.get("content", "")
+            # system and user lines may carry an attachment and are handed to
+            # json.dumps as-is, so they can keep the OpenAI part array. The
+            # assistant line below is fed through re.sub, and the tool line through
+            # an f-string, so those stay flattened text.
+            if role == "system":
+                hist_lines.append({"role": "system", "content": _history_content(raw)})
+                continue
+            if role == "user":
+                last_user = _content_str(raw)
+                hist_lines.append({"role": "user", "content": _history_content(raw)})
+                continue
+            # system, user and tool lines keep the OpenAI part array when the message
+            # carried a file, so an attachment stays in the position it was sent
+            # between the text parts. The assistant line does NOT: an assistant
+            # turn never carries media, and it has to stay a string for the re.sub
+            # below and the tc_text concatenation.
+            if role == "assistant":
+                content = _content_str(raw)
+                reasoning = ZaiSession._reasoning_str(m)
+                calls = []
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    raw_args = fn.get("arguments", {})
+                    if isinstance(raw_args, str):
+                        try:
+                            args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            args = {"_raw": str(raw_args)}
+                    else:
+                        args = raw_args or {}
+                    calls.append({"name": fn.get("name", "unknown"), "arguments": args})
+                # Tool calls are folded into the SAME content field as native
+                # GLM <tc> XML blocks at the end (the shape the model
+                # itself must emit), instead of a separate tool_calls key.
+                # Each chat-format line the assistant wrote into its own text is a
+                # hallucinated turn, not a real message: tag every such JSON object.
+                # The prose around them and the <tc> calls stay outside.
+                content = re.sub(
+                    r'\{[^{}]*\\?"role\\?"\s*:[^{}]*\}',
+                    lambda m: "<maybe_fake_history>{}</maybe_fake_history>".format(m.group(0)),
+                    content)
+                tc_text = ("\n".join(
+                    tool_call_xml(c["name"], c.get("arguments") or {}) for c in calls)
+                    if calls else "")
+                line = {"role": "assistant", "content": content or ""}
+                if reasoning:
+                    line["thinking"] = reasoning
+                # The tool block is appended AFTER the line is dumped, never inside
+                # its JSON string: there every escape would gain a second backslash,
+                # so the model would read a newline where it wrote one and copy a
+                # broken value back out. Raw, the block is exactly the shape the model
+                # itself emits, so a value copied out of the history parses to what
+                # was sent.
+                line = json.dumps(line, ensure_ascii=False)
+                if tc_text:
+                    line = line + "\n" + tc_text
+                line = _unescape_value(line)
+                hist_lines.append(line)
+            elif role == "tool":
+                label = call_label_by_id.get(m.get("tool_call_id"), "unknown")
+                hist_lines.append({"role": "tool", "name": label,
+                                   "content": _tool_history_content(raw)})
+
+        # The first system message (if any) becomes the "[System instructions]"
+        # block and is placed right after the History header below.
+        system_instr = None
+        if (hist_lines and isinstance(hist_lines[0], dict)
+                and hist_lines[0].get("role") == "system"):
+            system_instr = hist_lines.pop(0)["content"]
+
+        parts = []
+        tool_names = ["None"]
+
+        # 1. tool block, ALWAYS ("None" when the request carried no tools)
+        if tools:
+            tool_names = [t.get("function", {}).get("name", "?") for t in tools] or ["None"]
+        details = render_tools_block(tools) if tools else "None"
+        parts.append(TOOL_PROMPT_TEMPLATE.format(tool_details=details, instructions=TOOL_INSTRUCTIONS))
+        # 2. Allowed tools, ALWAYS (tool_names defaults to ["None"])
+        if tool_names:
+            parts.append("<allowed_tools>\n Allowed tools: " + ", ".join(tool_names) + "\n</allowed_tools>")
+        # 3. History header
+        parts.append("# History (oldest first), each line is one message:")
+        # [System instructions] directly after the history header, as a proper
+        # role=system message line
+        if system_instr:
+            parts.append(_unescape_value(json.dumps({"role": "system", "content": system_instr}, ensure_ascii=False)))
+        # 4. FINAL_SYSTEM_MESSAGE as a separate line (only if tools)
+        if tools:
+            final_line = json.dumps({"role": "system", "content": FINAL_SYSTEM_MESSAGE}, ensure_ascii=False)
+            parts.append(_unescape_value(final_line))
+        # 5. Each history line as JSON (one escaping layer, same as every other section)
+        for h in hist_lines:
+            # An assistant turn that carried tool calls is already rendered.
+            if isinstance(h, str):
+                parts.append(h)
+            elif isinstance(h, dict):
+                parts.append(_unescape_value(json.dumps(h, ensure_ascii=False)))
+            else:
+                parts.append(json.dumps(h, ensure_ascii=False))
+
+        convo = "\n\n".join(parts)
+
+        return (
+            "{convo}\n\n"
+            "<task>\n"
+            "{system_continue}\n"
+            "Continue (Or write if you haven't received an answer yet) Assistant's reply, ONLY content\n</task>"
+        ).format(convo=convo, system_continue=SYSTEM_CONTINUE), last_user
 
     async def stream_tokens(self, timeout_s=300):
         """Yield (phase, delta) tuples until done."""
@@ -2230,7 +2523,7 @@ async def chat_completions(request: Request):
                 log(f"--> done: reasoning={sum(len(x) for x in full_reasoning)}ch "
                     f"answer={sum(len(x) for x in full_answer)}ch "
 f"prompt_len={prompt_len} | model={req_model}", level="OK")
-                USAGE.add("Reasoning" if thinking_level != "off" else "Chat", prompt,
+                USAGE.add(req_model, prompt,
                           reasoning="".join(full_reasoning),
                           answer="".join(full_answer))
                 with open("last_response.json", "w", encoding="utf-8") as f:
@@ -2378,7 +2671,7 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
     log(f"--> done: reasoning={sum(len(x) for x in reasoning_parts)}ch "
         f"answer={sum(len(x) for x in answer_parts)}ch "
         f"prompt_len={prompt_len} | model={req_model}", level="OK")
-    USAGE.add("Reasoning" if thinking_level != "off" else "Chat", prompt,
+    USAGE.add(req_model, prompt,
               reasoning="".join(reasoning_parts), answer="".join(answer_parts))
     if has_tools:
         calls = parse_tool_call_blocks(raw_answer)
@@ -2616,10 +2909,6 @@ def _gradient_lines(lines, width):
     return out
 
 
-# ===== USAGE STATS =====
-# Split by the DeepThink switch: "Reasoning" is the reasoner model, "Chat" is
-# plain completion. Every counter is cumulative across runs.
-USAGE_GROUPS = ("Chat", "Reasoning")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                 "prompt_chars", "answer_chars")
 
@@ -2645,7 +2934,7 @@ class Usage:
     def __init__(self, path=STATS_FILE):
         self.path = path
         self.lock = threading.Lock()
-        self.groups = {g: dict.fromkeys(USAGE_FIELDS, 0) for g in USAGE_GROUPS}
+        self.groups = {}
         self._load()
 
     def _load(self):
@@ -2657,6 +2946,10 @@ class Usage:
         except Exception:
             return
         for name, row in (saved.get("groups") or {}).items():
+            if name == "Reasoning":
+                name = "x-preview-l"
+            elif name == "Chat":
+                continue
             target = self.groups.setdefault(name, dict.fromkeys(USAGE_FIELDS, 0))
             for field in USAGE_FIELDS:
                 target[field] = int(row.get(field) or 0)
@@ -2751,13 +3044,33 @@ def _bar(fraction, width, minimum=False):
     return "".join(cells)
 
 
-# Group key -> heading. The split follows the reasoning switch, so it tracks
-# what actually costs tokens rather than the model list, which the site serves
-# dynamically.
-# Group key -> heading. The split follows the reasoning switch, so it tracks
-# what actually costs tokens rather than the model list, which the site serves
-# dynamically.
-GROUP_TITLES = (("Chat", "GLM Chat"), ("Reasoning", "GLM Reasoning"))
+
+
+def _accounts_block(width):
+    """The pool's accounts, under the usage numbers.
+
+    Rotation picks from this list in order, so the menu is the one place the
+    whole roster is visible at once - and an account with no address would
+    otherwise be a mystery if it ever came up. There is no chat mute to report
+    here the way there is on DeepSeek: an account on this site is either
+    serving or it is not, so the roster is the whole story.
+    """
+    accounts = getattr(pool, "_accounts", None) or []
+    if not accounts:
+        return []
+    out = ["  Accounts:"]
+    for i, acc in enumerate(accounts):
+        name = (acc.get("email") or "").strip() or f"account #{i}"
+        row = f"  - {name}"
+        if _visible_len(row) < width:
+            out.append(row)
+            continue
+        # Unreachable in practice - the banner alone forces the terminal past
+        # 130 columns and an address is far shorter than that - but a row printed
+        # at exactly the terminal width leaves the cursor in pending-wrap, which
+        # is what makes the caret arithmetic in _render_menu ambiguous.
+        out.append(f"  - {name[:max(4, width - 5)]}…")
+    return out
 
 
 def _stats_lines(width):
@@ -2767,10 +3080,13 @@ def _stats_lines(width):
     the numbers stay meaningful without inventing a quota: "All" is always
     100% and a group is whatever slice of it it has actually used."""
     rows, total = USAGE.snapshot()
+    accounts = _accounts_block(width)
     if not any(total.values()):
         # Nothing has been served yet (a fresh stats.json). A block of zeroes
-        # and full bars says less than showing no block at all.
-        return []
+        # and full bars says less than showing no block at all - but which
+        # accounts this pool can serve is live state and is worth showing even
+        # before the first token is served.
+        return accounts
     grand = _metric_values(total)
     grand_map = dict(grand)
 
@@ -2778,8 +3094,7 @@ def _stats_lines(width):
     # print, not to a fixed width: a block that has not grown past six digits
     # should not be padded to room for eleven, and one that has should not
     # start shoving its bars off the right edge.
-    per_group = {g: _metric_values(rows.get(g) or dict.fromkeys(USAGE_FIELDS, 0))
-                 for g, _ in GROUP_TITLES}
+    per_group = {g: _metric_values(rows[g]) for g in rows}
     every = list(grand) + [v for values in per_group.values() for v in values]
     value_w = max((len(_spaced(v)) for _, v in every), default=1)
 
@@ -2823,7 +3138,7 @@ def _stats_lines(width):
     # percentage that will actually be printed and pad to the widest.
     pct_w = max(
         (len(pct_text(row_share(name, value)))
-         for group, _ in GROUP_TITLES
+         for group in rows
          for name, value in per_group[group]
          if value),
         default=4,
@@ -2851,9 +3166,11 @@ def _stats_lines(width):
         return lines
 
     out += block("All", grand, True)
-    for group, title in GROUP_TITLES:
-        if any(rows.get(group, {}).values()):
-            out += [""] + block(title, per_group[group], False)
+    for group in rows:
+        if any(rows[group].values()):
+            out += [""] + block(group, per_group[group], False)
+    if accounts:
+        out += [""] + accounts
     return out
 
 
