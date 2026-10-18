@@ -807,86 +807,6 @@ class ToolStreamBuffer:
             return [("calls", calls)] if calls else []
         return [("text", leftover)]
 
-THINKING_TRIGGER_JS = """
-    () => {
-        // find the "Deep Think" dropdown trigger near the input
-        const candidates = [...document.querySelectorAll('button, [aria-haspopup]')];
-        const trig = candidates.find(b => {
-            const t = (b.textContent || '').trim();
-            return /deep think/i.test(t) && (b.offsetWidth || b.offsetHeight);
-        });
-        if (!trig) return {found: false};
-        trig.click();
-        return {found: true};
-    }
-"""
-
-# Simple think toggle for models WITHOUT the Deep Think dropdown
-# (button carries data-autothink="true"/"false")
-THINKING_SIMPLE_TOGGLE_JS = """
-    (wantOn) => {
-        const btns = [...document.querySelectorAll('button[data-autothink]')]
-            .filter(b => b.offsetWidth || b.offsetHeight);
-        if (!btns.length) return {found: false};
-        const btn = btns[0];
-        const isOn = btn.getAttribute('data-autothink') === 'true';
-        if (isOn !== wantOn) {
-            btn.click();
-            return {found: true, changed: true};
-        }
-        return {found: true, changed: false};
-    }
-"""
-
-THINKING_SWITCH_STATE_JS = """
-    () => {
-        const sws = [...document.querySelectorAll('[role="switch"]')]
-            .filter(s => s.offsetWidth || s.offsetHeight);
-        if (!sws.length) return null;
-        const sw = sws[0];
-        return sw.getAttribute('data-state')
-            || (sw.getAttribute('aria-checked') === 'true' ? 'checked' : 'unchecked');
-    }
-"""
-
-THINKING_SWITCH_CLICK_JS = """
-    () => {
-        const sws = [...document.querySelectorAll('[role="switch"]')]
-            .filter(s => s.offsetWidth || s.offsetHeight);
-        if (!sws.length) return false;
-        sws[0].click();
-        return true;
-    }
-"""
-
-THINKING_CLICK_JS = """
-    (levelUpper) => {
-        const tryClick = (matcher) => {
-            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-            let node;
-            while ((node = walker.nextNode())) {
-                const t = (node.textContent || '').trim();
-                if (!matcher(t)) continue;
-                let el = node.parentElement;
-                if (el.closest('[aria-haspopup]')) continue;
-                while (el && el !== document.body) {
-                    const role = el.getAttribute('role');
-                    if (el.tagName === 'BUTTON' || el.tagName === 'LI'
-                        || role === 'option' || role === 'menuitem' || role === 'menuitemradio') {
-                        el.click();
-                        return true;
-                    }
-                    el = el.parentElement;
-                }
-            }
-            return false;
-        };
-        // exact first, then prefix match
-        return tryClick(t => t.toUpperCase() === levelUpper)
-            || tryClick(t => t.toUpperCase().startsWith(levelUpper));
-    }
-"""
-
 
 async def poll_js(page, expr, arg=None, timeout_s=10, poll_ms=100):
     deadline = time.time() + timeout_s
@@ -1498,56 +1418,6 @@ class ZaiSession:
         self._models_cache = models
         self._models_cache_ts = time.time()
         return models
-
-       
-    @staticmethod
-    def map_thinking(effort):
-        """OpenAI reasoning_effort -> site Deep Think level."""
-        if not effort:
-            return "max"  # no effort specified -> max by default
-        e = str(effort).lower()
-        if e in ("default", "minimal", "off", "none"):
-            return "off"
-        if e in ("low", "medium", "high", "max"):
-            return e
-        return "max"  # unknown values -> max
-
-    async def set_thinking(self, level):
-        """Set thinking: Deep Think dropdown (5.x) or simple toggle (other models)."""
-        res = await self.page.evaluate(THINKING_TRIGGER_JS)
-
-        if not res or not res.get("found"):
-            # fallback: models with plain think toggle button
-            r = await self.page.evaluate(THINKING_SIMPLE_TOGGLE_JS, level != "off")
-            if not r or not r.get("found"):
-                log(f"[thinking] no Deep Think dropdown and no toggle found (wanted {level})", level="WARN")
-                return False
-            return True
-
-        await asyncio.sleep(0.3)
-
-        if level == "off":
-            state = await self.page.evaluate(THINKING_SWITCH_STATE_JS)
-            if state is None:
-                log("[thinking] switch not found in dropdown", level="WARN")
-            elif state == "checked":
-                await self.page.evaluate(THINKING_SWITCH_CLICK_JS)
-            await self.page.keyboard.press("Escape")
-            return True
-
-        # high / max: ensure switch is ON first
-        state = await self.page.evaluate(THINKING_SWITCH_STATE_JS)
-        if state is None:
-            log("[thinking] switch not found, trying option directly", level="WARN")
-        elif state != "checked":
-            await self.page.evaluate(THINKING_SWITCH_CLICK_JS)
-            await asyncio.sleep(0.4)  # wait for level options to render
-
-        clicked = await poll_js(self.page, THINKING_CLICK_JS, level.upper(), timeout_s=3, poll_ms=100)
-        if not clicked:
-            log(f"[thinking] option '{level}' not found in dropdown", level="WARN")
-        await self.page.keyboard.press("Escape")
-        return bool(clicked)
 
     async def _watch_uploads(self):
         """Attach the network feed once, and report whether it is available.
@@ -2281,7 +2151,6 @@ async def chat_completions(request: Request):
     req_model = req_model_canonical
 
     prompt, _last_user = session.build_prompt(messages, tools=body.get("tools"))
-    thinking_level = session.map_thinking(body.get("reasoning_effort"))
     has_tools = bool(body.get("tools"))
     media = collect_media_parts(messages)
     prompt_len = len(prompt)
@@ -2336,7 +2205,6 @@ async def chat_completions(request: Request):
 
                 try:
                     await wk.prepare_chat(req_model)
-                    await wk.set_thinking(thinking_level)
                     await wk.send_message(prompt, media=media)
                 except Exception as e:
                     # a captcha/block during prepare also reloads forever
@@ -2551,7 +2419,6 @@ f"prompt_len={prompt_len} | model={req_model}", level="OK")
 
             try:
                 await wk.prepare_chat(req_model)
-                await wk.set_thinking(thinking_level)
                 await wk.send_message(prompt, media=media)
             except Exception as e:
                 # a captcha/block during prepare also reloads forever
