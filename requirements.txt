@@ -2,3 +2,4 @@ playwright>=1.49.0
 fastapi>=0.115.0
 uvicorn>=0.32.0
 deepseek-tokenizer>=0.3.0
+py3langid>=0.4.0
